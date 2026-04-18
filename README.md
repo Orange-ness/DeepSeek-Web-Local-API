@@ -108,6 +108,22 @@ curl http://127.0.0.1:8787/v1/chat/completions \
   }'
 ```
 
+## Using with OpenAI-Compatible Clients
+
+You can add an API key to your local proxy and then use it with any app/plugin that supports custom OpenAI endpoints (like UI dashboards, IDE extensions, CLI tools).
+
+1. Open your `.env` file and set a custom API key:
+   ```env
+   LOCAL_API_KEY=sk-my-secret-key
+   ```
+2. Restart your local server.
+
+Now configure your external application using these settings:
+
+- **API Base URL / Endpoint URL**: `http://127.0.0.1:8787/v1`
+- **API Key / Bearer Token**: `sk-my-secret-key` (or whatever you set above)
+- **Model**: `deepseek-web-chat` or `deepseek-web-think`
+
 ## Helper Scripts
 
 Smoke test:
