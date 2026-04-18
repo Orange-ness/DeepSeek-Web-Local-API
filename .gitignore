@@ -1,0 +1,8 @@
+node_modules/
+.deepseek-web-api/
+coverage/
+npm-debug.log*
+.env
+.env.local
+.codex
+.editorconfig

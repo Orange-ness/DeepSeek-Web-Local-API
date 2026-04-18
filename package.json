@@ -1,0 +1,33 @@
+{
+  "name": "deepseek-web-local-api",
+  "version": "0.1.0",
+  "description": "Local OpenAI-compatible wrapper around chat.deepseek.com",
+  "license": "MIT",
+  "keywords": [
+    "deepseek",
+    "openai-compatible",
+    "sse",
+    "playwright",
+    "local-api"
+  ],
+  "packageManager": "npm@11.12.1",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "test": "node --test test/*.test.js",
+    "smoke": "node scripts/test-local-api.mjs",
+    "verify": "node scripts/verify-local-api.mjs",
+    "setup": "node scripts/setup-local-api.mjs"
+  },
+  "engines": {
+    "node": ">=25.0.0"
+  },
+  "dependencies": {
+    "fastify": "^5.6.1",
+    "playwright-core": "^1.55.0",
+    "undici": "^7.16.0",
+    "zod": "^4.1.12"
+  }
+}

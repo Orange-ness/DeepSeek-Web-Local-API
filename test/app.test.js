@@ -1,0 +1,356 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { buildApp } from '../src/app.js';
+import { resolveConfig } from '../src/config.js';
+import { DeepSeekWebClient } from '../src/deepseek/client.js';
+
+test('health reports authenticated session and upstream reachability', async () => {
+  const app = buildTestApp();
+
+  await app.ready();
+  const response = await app.inject({
+    method: 'GET',
+    url: '/health'
+  });
+
+  const payload = response.json();
+  assert.equal(response.statusCode, 200);
+  assert.equal(payload.deepseek_session.authenticated, true);
+  assert.equal(payload.upstream.reachable, true);
+
+  await app.close();
+});
+
+test('non-stream chat completion buffers upstream SSE', async () => {
+  const app = buildTestApp();
+
+  await app.ready();
+  const response = await app.inject({
+    method: 'POST',
+    url: '/v1/chat/completions',
+    payload: {
+      model: 'deepseek-chat',
+      messages: [{ role: 'user', content: 'Hello' }]
+    }
+  });
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.json().choices[0].message.content, 'Hello from the fake upstream');
+
+  await app.close();
+});
+
+test('streaming chat completion emits OpenAI-style SSE', async () => {
+  const app = buildTestApp();
+
+  await app.ready();
+  const response = await app.inject({
+    method: 'POST',
+    url: '/v1/chat/completions',
+    payload: {
+      model: 'deepseek-web-chat',
+      stream: true,
+      messages: [{ role: 'user', content: 'Hello' }]
+    }
+  });
+
+  assert.equal(response.statusCode, 200);
+  assert.match(response.body, /chat\.completion\.chunk/);
+  assert.match(response.body, /"content":"Hello"/);
+  assert.match(response.body, /"content":" from the fake upstream"/);
+  assert.match(response.body, /\[DONE\]/);
+
+  await app.close();
+});
+
+test('chat completion surfaces upstream auth failures', async () => {
+  const app = buildTestApp({ errorStatus: 401 });
+
+  await app.ready();
+  const response = await app.inject({
+    method: 'POST',
+    url: '/v1/chat/completions',
+    payload: {
+      model: 'deepseek-web-chat',
+      messages: [{ role: 'user', content: 'Hello' }]
+    }
+  });
+
+  assert.equal(response.statusCode, 401);
+  assert.equal(response.json().error.type, 'upstream_401');
+
+  await app.close();
+});
+
+test('chat completion surfaces upstream rate limiting', async () => {
+  const app = buildTestApp({ errorStatus: 429 });
+
+  await app.ready();
+  const response = await app.inject({
+    method: 'POST',
+    url: '/v1/chat/completions',
+    payload: {
+      model: 'deepseek-web-think',
+      messages: [{ role: 'user', content: 'Hello' }]
+    }
+  });
+
+  assert.equal(response.statusCode, 429);
+  assert.equal(response.json().error.type, 'upstream_429');
+
+  await app.close();
+});
+
+test('chat completion maps upstream 5xx to bad gateway', async () => {
+  const app = buildTestApp({ errorStatus: 500 });
+
+  await app.ready();
+  const response = await app.inject({
+    method: 'POST',
+    url: '/v1/chat/completions',
+    payload: {
+      model: 'deepseek-web-chat',
+      messages: [{ role: 'user', content: 'Hello' }]
+    }
+  });
+
+  assert.equal(response.statusCode, 502);
+  assert.equal(response.json().error.type, 'upstream_500');
+
+  await app.close();
+});
+
+test('auth debug and metrics expose the new diagnostics', async () => {
+  const app = buildTestApp();
+
+  await app.ready();
+  const authDebug = await app.inject({
+    method: 'GET',
+    url: '/auth/debug'
+  });
+  const metrics = await app.inject({
+    method: 'GET',
+    url: '/metrics'
+  });
+
+  assert.equal(authDebug.statusCode, 200);
+  assert.equal(authDebug.json().auth_token_present, true);
+  assert.equal(metrics.statusCode, 200);
+  assert.equal(metrics.json().http.totalRequests >= 1, true);
+
+  await app.close();
+});
+
+test('upstream trace endpoints expose trace ids from chat completions', async () => {
+  const app = buildTestApp();
+
+  await app.ready();
+  const completion = await app.inject({
+    method: 'POST',
+    url: '/v1/chat/completions',
+    payload: {
+      model: 'deepseek-web-chat',
+      messages: [{ role: 'user', content: 'Hello' }],
+      debug_upstream: true
+    }
+  });
+
+  assert.equal(completion.statusCode, 200);
+  const traceId = completion.headers['x-upstream-trace-id'];
+  assert.equal(typeof traceId, 'string');
+  assert.equal(traceId.length > 0, true);
+
+  const latestTrace = await app.inject({
+    method: 'GET',
+    url: '/debug/upstream/latest'
+  });
+  const traceById = await app.inject({
+    method: 'GET',
+    url: `/debug/upstream/${traceId}`
+  });
+
+  assert.equal(latestTrace.statusCode, 200);
+  assert.equal(traceById.statusCode, 200);
+  assert.equal(latestTrace.json().id, traceId);
+  assert.equal(traceById.json().id, traceId);
+  assert.equal(Array.isArray(traceById.json().steps), true);
+
+  await app.close();
+});
+
+function buildTestApp({ errorStatus = null } = {}) {
+  const baseUrl = 'https://fake.deepseek.local/api/v0';
+  const config = resolveConfig({
+    HOST: '127.0.0.1',
+    PORT: '8787',
+    DATA_DIR: '.deepseek-web-api-test',
+    DEEPSEEK_BASE_URL: baseUrl
+  });
+
+  const session = {
+    authenticated: true,
+    lastLoginMode: 'browser',
+    updatedAt: new Date().toISOString(),
+    expiresAt: null,
+    authToken: 'test-token',
+    cookieHeader: 'cf_clearance=ok',
+    transport: {
+      baseUrl,
+      createChatSessionUrl: `${baseUrl}/chat_session/create`,
+      chatCompletionUrl: `${baseUrl}/chat/completion`,
+      headers: {
+        accept: '*/*',
+        'content-type': 'application/json',
+        origin: baseUrl,
+        referer: baseUrl,
+        'user-agent': 'test-agent'
+      }
+    }
+  };
+
+  const sessionManager = {
+    store: {
+      async load() {
+        return session;
+      }
+    },
+    async getStatus() {
+      return {
+        authenticated: true,
+        expires_at: null,
+        last_login_mode: 'browser',
+        updated_at: session.updatedAt,
+        transport_source: 'test'
+      };
+    },
+    async requireSession() {
+      return session;
+    },
+    async loginWithBrowser() {
+      return this.getStatus();
+    },
+    async loginWithPassword() {
+      return this.getStatus();
+    },
+    async loginAuto() {
+      return {
+        ...(await this.getStatus()),
+        strategy: 'existing-session'
+      };
+    },
+    async refreshSession() {
+      return {
+        ...(await this.getStatus()),
+        strategy: 'existing-session',
+        refresh_reason: 'test'
+      };
+    },
+    async getDebugInfo() {
+      return {
+        ...(await this.getStatus()),
+        session_present: true,
+        auth_token_present: true,
+        cookie_header_present: true,
+        cookie_names: ['cf_clearance'],
+        local_storage_keys: ['userToken'],
+        transport: {
+          source: 'test',
+          captured_at: null,
+          base_url: baseUrl,
+          create_chat_session_url: `${baseUrl}/chat_session/create`,
+          chat_completion_url: `${baseUrl}/chat/completion`,
+          header_keys: ['accept', 'content-type', 'origin', 'referer', 'user-agent']
+        }
+      };
+    },
+    async logout() {
+      return {
+        authenticated: false,
+        expires_at: null,
+        last_login_mode: null,
+        updated_at: null,
+        transport_source: null
+      };
+    }
+  };
+
+  return buildApp({
+    config,
+    sessionManager,
+    client: new DeepSeekWebClient(config, {
+      fetchImpl: createFakeFetch({ baseUrl, errorStatus }),
+      powResponseBuilder: async () => 'fake-pow'
+    })
+  });
+}
+
+function createFakeFetch({ baseUrl, errorStatus }) {
+  return async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.toString();
+    const method = init.method || 'GET';
+
+    if (url === 'https://fake.deepseek.local/') {
+      return new Response('ok', {
+        status: 200,
+        headers: { 'content-type': 'text/plain' }
+      });
+    }
+
+    if (url === `${baseUrl}/chat_session/create` && method === 'POST') {
+      return new Response(JSON.stringify({ data: { biz_data: { id: 'session-123' } } }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      });
+    }
+
+    if (url === 'https://chat.deepseek.com/api/v0/chat/create_pow_challenge' && method === 'POST') {
+      return new Response(JSON.stringify({
+        data: {
+          biz_data: {
+            challenge: {
+              algorithm: 'DeepSeekHashV1',
+              challenge: 'abc',
+              salt: 'salt',
+              signature: 'sig',
+              difficulty: 1,
+              expire_at: 1
+            }
+          }
+        }
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      });
+    }
+
+    if (url === `${baseUrl}/chat/completion` && method === 'POST') {
+      if (errorStatus) {
+        return new Response(JSON.stringify({ error: `status-${errorStatus}` }), {
+          status: errorStatus,
+          headers: { 'content-type': 'application/json' }
+        });
+      }
+
+      const body = new ReadableStream({
+        start(controller) {
+          controller.enqueue(encoder.encode('event: ready\ndata: {"request_message_id":1,"response_message_id":2}\n\n'));
+          controller.enqueue(encoder.encode('data: {"p":"response/content","o":"APPEND","v":"Hello"}\n\n'));
+          controller.enqueue(encoder.encode('data: {"v":" from the fake upstream"}\n\n'));
+          controller.enqueue(encoder.encode('data: {"p":"response/status","v":"FINISHED"}\n\n'));
+          controller.enqueue(encoder.encode('event: title\ndata: {"content":"Metadata title that should be ignored"}\n\n'));
+          controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+          controller.close();
+        }
+      });
+
+      return new Response(body, {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream; charset=utf-8' }
+      });
+    }
+
+    return new Response('not found', { status: 404 });
+  };
+}
+
+const encoder = new TextEncoder();
