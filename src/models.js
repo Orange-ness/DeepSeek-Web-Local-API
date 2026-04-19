@@ -19,12 +19,12 @@ export const PUBLIC_MODELS = [
 const textPartSchema = z.object({
   type: z.literal('text'),
   text: z.string()
-}).strict();
+}).passthrough();
 
 const chatMessageSchema = z.object({
-  role: z.enum(['system', 'user', 'assistant']),
-  content: z.union([z.string(), z.array(textPartSchema).min(1)])
-}).strict();
+  role: z.enum(['system', 'developer', 'user', 'assistant']),
+  content: z.union([z.string(), z.null(), z.array(textPartSchema).min(1)])
+}).passthrough();
 
 const metadataValueSchema = z.union([z.string(), z.number(), z.boolean()]);
 const responseFormatSchema = z.object({
@@ -37,10 +37,36 @@ export const chatCompletionRequestSchema = z.object({
   stream: z.boolean().optional().default(false),
   temperature: z.number().min(0).max(2).optional(),
   max_tokens: z.number().int().positive().optional(),
+  max_completion_tokens: z.number().int().positive().optional(),
+  top_p: z.number().optional(),
+  presence_penalty: z.number().optional(),
+  frequency_penalty: z.number().optional(),
+  stop: z.union([z.string(), z.array(z.string()).min(1)]).optional(),
+  n: z.number().int().positive().optional(),
+  user: z.string().optional(),
+  stream_options: z.object({
+    include_usage: z.boolean().optional()
+  }).passthrough().optional(),
+  seed: z.number().int().optional(),
+  store: z.boolean().optional(),
+  reasoning_effort: z.string().optional(),
+  service_tier: z.string().optional(),
+  parallel_tool_calls: z.boolean().optional(),
+  tool_choice: z.union([z.string(), z.object({}).passthrough()]).optional(),
+  function_call: z.union([z.string(), z.object({}).passthrough()]).optional(),
+  tools: z.array(z.unknown()).optional(),
+  functions: z.array(z.unknown()).optional(),
+  modalities: z.array(z.string()).optional(),
+  audio: z.object({}).passthrough().optional(),
+  prediction: z.object({}).passthrough().optional(),
+  web_search_options: z.object({}).passthrough().optional(),
+  logprobs: z.union([z.boolean(), z.number().int().nonnegative()]).optional(),
+  top_logprobs: z.number().int().nonnegative().optional(),
+  logit_bias: z.record(z.string(), z.number()).optional(),
   metadata: z.record(z.string(), metadataValueSchema).optional(),
   response_format: responseFormatSchema.optional(),
   debug_upstream: z.boolean().optional().default(false)
-}).strict();
+}).passthrough();
 
 export const passwordLoginSchema = z.object({
   email: z.email(),
@@ -82,10 +108,12 @@ const MODEL_ALIASES = new Map([
 export function parseChatCompletionRequest(payload) {
   try {
     const parsed = chatCompletionRequestSchema.parse(payload);
+    validateIgnoredChatFields(parsed);
     return {
       ...parsed,
+      max_tokens: parsed.max_tokens ?? parsed.max_completion_tokens,
       messages: parsed.messages.map((message) => ({
-        role: message.role,
+        role: normalizeMessageRole(message.role),
         content: normalizeMessageContent(message.content)
       }))
     };
@@ -128,11 +156,41 @@ export function parseCleanupSessions(payload) {
 }
 
 export function normalizeMessageContent(content) {
+  if (content == null) {
+    return '';
+  }
+
   if (typeof content === 'string') {
     return content;
   }
 
   return content.map((part) => part.text).join('');
+}
+
+function normalizeMessageRole(role) {
+  return role === 'developer' ? 'system' : role;
+}
+
+function validateIgnoredChatFields(payload) {
+  if (payload.n !== undefined && payload.n !== 1) {
+    throw new BadRequestError('Only n=1 is supported for chat completions.');
+  }
+
+  if (Array.isArray(payload.tools) && payload.tools.length > 0) {
+    throw new BadRequestError('Tool calling is not supported yet.');
+  }
+
+  if (Array.isArray(payload.functions) && payload.functions.length > 0) {
+    throw new BadRequestError('Function calling is not supported yet.');
+  }
+
+  if (Array.isArray(payload.modalities) && payload.modalities.some((item) => item !== 'text')) {
+    throw new BadRequestError('Only text modality is supported.');
+  }
+
+  if (payload.audio) {
+    throw new BadRequestError('Audio output is not supported.');
+  }
 }
 
 export function flattenMessagesToPrompt(messages, { responseFormat } = {}) {

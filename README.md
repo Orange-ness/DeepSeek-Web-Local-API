@@ -127,6 +127,8 @@ Now configure your external application using these settings:
 - **API Key / Bearer Token**: `sk-my-secret-key` (or whatever you set above)
 - **Model**: `deepseek-web-chat` or `deepseek-web-think`
 
+For compatibility with clients like Continue, the server also accepts and ignores several common OpenAI chat fields when they are harmless, such as `top_p`, `presence_penalty`, `frequency_penalty`, `stop`, `stream_options`, and `max_completion_tokens`. Non-empty tool/function calling payloads and non-text modalities are still rejected.
+
 ## Helper Scripts
 
 Smoke test:

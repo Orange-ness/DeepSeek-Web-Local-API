@@ -24,6 +24,32 @@ test('parseChatCompletionRequest normalizes text arrays', () => {
   assert.equal(parsed.messages[0].content, 'hello world');
 });
 
+test('parseChatCompletionRequest accepts common OpenAI-compatible extra fields', () => {
+  const parsed = parseChatCompletionRequest({
+    model: 'deepseek-web-chat',
+    stream: true,
+    temperature: 0.2,
+    top_p: 1,
+    presence_penalty: 0,
+    frequency_penalty: 0,
+    n: 1,
+    max_completion_tokens: 256,
+    stop: ['</final>'],
+    user: 'continue-user',
+    stream_options: { include_usage: true },
+    tools: [],
+    functions: [],
+    messages: [
+      { role: 'developer', content: 'You are a careful coding assistant.' },
+      { role: 'user', content: 'Hello' }
+    ]
+  });
+
+  assert.equal(parsed.max_tokens, 256);
+  assert.equal(parsed.messages[0].role, 'system');
+  assert.equal(parsed.messages[0].content, 'You are a careful coding assistant.');
+});
+
 test('parseChatCompletionRequest rejects unsupported message content', () => {
   assert.throws(() => {
     parseChatCompletionRequest({
@@ -34,6 +60,24 @@ test('parseChatCompletionRequest rejects unsupported message content', () => {
           content: [{ type: 'image_url', image_url: { url: 'x' } }]
         }
       ]
+    });
+  });
+});
+
+test('parseChatCompletionRequest rejects unsupported tool calls and n>1', () => {
+  assert.throws(() => {
+    parseChatCompletionRequest({
+      model: 'deepseek-web-chat',
+      n: 2,
+      messages: [{ role: 'user', content: 'Hello' }]
+    });
+  });
+
+  assert.throws(() => {
+    parseChatCompletionRequest({
+      model: 'deepseek-web-chat',
+      tools: [{ type: 'function', function: { name: 'x' } }],
+      messages: [{ role: 'user', content: 'Hello' }]
     });
   });
 });
