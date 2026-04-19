@@ -25,6 +25,7 @@ export function buildApp({
     client,
     metrics
   });
+  app.decorate('deepSeekService', service);
 
   app.addHook('onRequest', async (request) => {
     request.metricsStartedAt = Date.now();
@@ -58,6 +59,7 @@ export function buildApp({
   app.post('/auth/login/auto', async (request) => service.loginAuto(request.body || {}));
   app.post('/auth/login/password', async (request) => service.loginWithPassword(request.body || {}));
   app.post('/auth/logout', async () => service.logout());
+  app.post('/debug/cleanup-sessions', async (request) => service.cleanupSessions(request.body || {}));
   app.get('/debug/upstream/latest', async () => service.getLatestUpstreamTrace());
   app.get('/debug/upstream/:id', async (request) => service.getUpstreamTraceById(request.params.id));
   app.get('/v1/models', async () => service.listModels());

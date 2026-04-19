@@ -62,6 +62,10 @@ export function extractDeepSeekText(payload, currentPatchPath = null) {
   }
 
   const candidates = [
+    payload?.v?.response?.fragments,
+    payload?.data?.v?.response?.fragments,
+    payload?.v?.response?.content,
+    payload?.data?.v?.response?.content,
     payload?.data?.content,
     payload?.data?.data?.content,
     payload?.data?.delta?.content,
@@ -87,13 +91,21 @@ export function extractDeepSeekText(payload, currentPatchPath = null) {
 
 function extractPatchDelta(payload, currentPatchPath) {
   if (typeof payload?.v === 'string') {
-    if (!currentPatchPath || String(currentPatchPath).startsWith('response/content')) {
+    if (
+      !currentPatchPath ||
+      String(currentPatchPath).startsWith('response/content') ||
+      String(currentPatchPath).startsWith('response/fragments')
+    ) {
       return payload.v;
     }
   }
 
   if (typeof payload?.data?.v === 'string') {
-    if (!currentPatchPath || String(currentPatchPath).startsWith('response/content')) {
+    if (
+      !currentPatchPath ||
+      String(currentPatchPath).startsWith('response/content') ||
+      String(currentPatchPath).startsWith('response/fragments')
+    ) {
       return payload.data.v;
     }
   }

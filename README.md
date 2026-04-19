@@ -8,6 +8,8 @@ A local Node.js server that exposes an OpenAI-compatible API on top of `https://
 - Password-first auto login with browser fallback
 - Persistent local DeepSeek session reuse
 - Built-in PoW challenge solving for `chat.deepseek.com`
+- Best-effort upstream chat session deletion after replies
+- Startup cleanup for tracked orphan chat sessions left behind by crashes or hard stops
 - Local metrics and upstream debug trace endpoints
 - Helper scripts for smoke tests, verification, and first-time setup
 
@@ -74,6 +76,7 @@ Passwords are never written to disk.
 - `POST /auth/login/password`
 - `POST /auth/login/auto`
 - `POST /auth/logout`
+- `POST /debug/cleanup-sessions`
 - `GET /debug/upstream/latest`
 - `GET /debug/upstream/:id`
 - `GET /v1/models`
@@ -107,6 +110,22 @@ curl http://127.0.0.1:8787/v1/chat/completions \
     ]
   }'
 ```
+
+## Using with OpenAI-Compatible Clients
+
+You can secure your local proxy and use it with any app/plugin that supports custom OpenAI endpoints (like UI dashboards, IDE extensions, CLI tools).
+
+1. Open your `.env` file and set a custom API key:
+   ```env
+   LOCAL_API_KEY=sk-my-secret-key
+   ```
+2. Restart your local server.
+
+Now configure your external application using these settings:
+
+- **API Base URL / Endpoint URL**: `http://127.0.0.1:8787/v1`
+- **API Key / Bearer Token**: `sk-my-secret-key` (or whatever you set above)
+- **Model**: `deepseek-web-chat` or `deepseek-web-think`
 
 ## Helper Scripts
 
@@ -173,6 +192,8 @@ npm run setup -- --browser-login
 - `DEEPSEEK_SIGN_IN_URL`: override the DeepSeek sign-in page URL
 - `DEEPSEEK_ORIGIN`: override the DeepSeek web origin used in default headers
 - `DEEPSEEK_DS_POW_RESPONSE`: optional static PoW header override for debugging
+- `DELETE_CHAT_SESSION_AFTER_COMPLETION`: delete the upstream DeepSeek chat session after each request, default `true`
+- `DELETE_CHAT_SESSION_TIMEOUT_MS`: timeout for the best-effort delete call
 - `LOCAL_API_BASE_URL`: helper script target, default `http://127.0.0.1:8787`
 - `DEEPSEEK_LOCAL_MODEL`: default model for `npm run smoke`
 - `DEEPSEEK_LOCAL_SYSTEM`: default system prompt for `npm run smoke`
@@ -194,6 +215,7 @@ See [.env.example](./.env.example) for a ready-to-copy template.
 
 - `GET /metrics` returns local request, auth, chat, queue, and trace counters
 - `GET /auth/debug` returns a sanitized view of the stored session and captured transport
+- `POST /debug/cleanup-sessions` manually deletes chat sessions from the DeepSeek account
 - `GET /debug/upstream/latest` returns the latest captured upstream trace
 - `GET /debug/upstream/:id` returns a specific upstream trace by ID
 - `x-upstream-trace-id` is added to chat completion responses
@@ -202,11 +224,32 @@ If you send `debug_upstream: true` in `POST /v1/chat/completions`, the non-strea
 
 `GET /debug/upstream/latest` is a global view for the whole local server. If multiple clients are using the API at the same time, it may move forward between two requests. For a stable lookup, use the response `x-upstream-trace-id` header with `GET /debug/upstream/:id`.
 
+By default, the server also sends a best-effort `POST /chat_session/delete` request to DeepSeek after each completion so the web account does not accumulate one chat thread per API call. Delete failures are ignored and do not fail the user response.
+
+At startup, the server also retries deletion for locally tracked chat sessions that were created by the API but never cleaned up because the process crashed or stopped abruptly.
+
+Manual cleanup examples:
+
+```bash
+curl -X POST http://127.0.0.1:8787/debug/cleanup-sessions \
+  -H 'content-type: application/json' \
+  -d '{"scope":"all","keep_recent":5,"max_delete":200}'
+```
+
+```bash
+curl -X POST http://127.0.0.1:8787/debug/cleanup-sessions \
+  -H 'content-type: application/json' \
+  -d '{"scope":"tracked"}'
+```
+
+`scope: "all"` deletes chat sessions visible on the account, while `scope: "tracked"` only retries locally tracked orphan sessions created by this API.
+
 ## Project Notes
 
 - This project is text-only for now
 - DeepSeek web endpoints may change over time
 - The server stores session artifacts locally, but never persists your password
+- Password-only login is more robust now, but DeepSeek anti-bot checks or social-login-only accounts can still force a visible browser fallback
 - This project depends on private web behavior from `chat.deepseek.com`, so breakage from upstream site changes is always possible
 
 ## Publishing Checklist

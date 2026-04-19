@@ -1,11 +1,14 @@
 import { fetch } from 'undici';
 import { createDeepSeekDeltaAssembler, iterateSseEvents } from '../sse.js';
 import { UpstreamError } from '../errors.js';
+import { PendingChatSessionStore } from '../storage.js';
 import { buildPowResponse } from './challenge.js';
+import { stripTrailingSlash } from './defaults.js';
 import { UpstreamTraceStore } from './trace-store.js';
 
 const CHAT_COMPLETION_TARGET_PATH = '/api/v0/chat/completion';
 const CREATE_POW_CHALLENGE_URL = 'https://chat.deepseek.com/api/v0/chat/create_pow_challenge';
+const FETCH_CHAT_SESSIONS_PATH = '/chat_session/fetch_page?lte_cursor.pinned=false';
 
 export class DeepSeekWebClient {
   constructor(
@@ -13,6 +16,7 @@ export class DeepSeekWebClient {
     {
       fetchImpl = fetch,
       powResponseBuilder = buildPowResponse,
+      pendingChatSessionStore = new PendingChatSessionStore(config),
       traceStore = new UpstreamTraceStore({
         maxTraces: config.upstreamTraceLimit,
         maxEventsPerTrace: config.upstreamTraceEventLimit,
@@ -23,6 +27,7 @@ export class DeepSeekWebClient {
     this.config = config;
     this.fetch = fetchImpl;
     this.powResponseBuilder = powResponseBuilder;
+    this.pendingChatSessionStore = pendingChatSessionStore;
     this.traceStore = traceStore;
   }
 
@@ -74,9 +79,14 @@ export class DeepSeekWebClient {
       metadata_keys: Object.keys(metadata || {}),
       response_format: responseFormat?.type || 'text'
     });
+    let chatSessionId = null;
+    let cleanup = createCleanupTask(async () => null);
 
     try {
-      const chatSessionId = await this.createChatSession(session, { trace, signal });
+      chatSessionId = await this.createChatSession(session, { trace, signal });
+      cleanup = createCleanupTask(() =>
+        this.deleteChatSession(session, chatSessionId, { trace })
+      );
       const powResponse = await this.createPowResponse(session, { trace, signal });
       const headers = buildHeaders(session, {
         'x-ds-pow-response': powResponse
@@ -128,13 +138,19 @@ export class DeepSeekWebClient {
 
       return {
         traceId: trace.id,
-        stream: createTrackedTextStream(response.body, {
-          trace,
-          traceStore: this.traceStore
-        }),
+        chatSessionId,
+        cleanup,
+        stream: createManagedTextStream(
+          createTrackedTextStream(response.body, {
+            trace,
+            traceStore: this.traceStore
+          }),
+          { onClose: cleanup }
+        ),
         response
       };
     } catch (error) {
+      await cleanup();
       this.traceStore.finish(trace, {
         status: 'failed',
         error: serializeError(error)
@@ -184,7 +200,11 @@ export class DeepSeekWebClient {
       'DeepSeek chat session creation failed.'
     );
 
-    const chatSessionId = payload?.data?.biz_data?.id || payload?.data?.id || payload?.id;
+    const chatSessionId =
+      payload?.data?.biz_data?.id ||
+      payload?.data?.biz_data?.chat_session?.id ||
+      payload?.data?.id ||
+      payload?.id;
     if (!chatSessionId) {
       throw new UpstreamError('DeepSeek chat session response did not include a session id.', {
         statusCode: 401,
@@ -196,6 +216,11 @@ export class DeepSeekWebClient {
       type: 'create_chat_session',
       status: response.status,
       chat_session_id: chatSessionId
+    });
+    await this.pendingChatSessionStore.add({
+      id: chatSessionId,
+      created_at: new Date().toISOString(),
+      source: 'api'
     });
 
     return chatSessionId;
@@ -234,6 +259,219 @@ export class DeepSeekWebClient {
     });
 
     return powResponse;
+  }
+
+  async deleteChatSession(session, chatSessionId, { trace } = {}) {
+    if (!this.config.deleteChatSessionAfterCompletion || !chatSessionId) {
+      return {
+        attempted: false,
+        deleted: false
+      };
+    }
+
+    const deleteUrl =
+      session?.transport?.deleteChatSessionUrl ||
+      `${stripTrailingSlash(session?.transport?.baseUrl || this.config.deepSeekBaseUrl)}/chat_session/delete`;
+
+    try {
+      const response = await this.fetch(deleteUrl, {
+        method: 'POST',
+        headers: buildHeaders(session),
+        body: JSON.stringify({ chat_session_id: chatSessionId }),
+        signal: createRequestSignal({
+          signal: null,
+          timeoutMs: this.config.deleteChatSessionTimeoutMs
+        })
+      });
+
+      const bodyText = await response.text().catch(() => '');
+      const payload = parseJson(bodyText);
+      const deleted = response.ok && isDeepSeekSuccessPayload(payload);
+      if (deleted) {
+        await this.pendingChatSessionStore.remove(chatSessionId);
+      }
+
+      this.traceStore.recordStep(trace, {
+        type: 'delete_chat_session',
+        status: response.status,
+        chat_session_id: chatSessionId,
+        deleted,
+        ...(deleted
+          ? {}
+          : {
+              delete_error:
+                payload?.msg ||
+                payload?.data?.biz_msg ||
+                response.statusText ||
+                'Unknown delete failure'
+            })
+      });
+
+      return {
+        attempted: true,
+        deleted,
+        statusCode: response.status
+      };
+    } catch (error) {
+      this.traceStore.recordStep(trace, {
+        type: 'delete_chat_session',
+        chat_session_id: chatSessionId,
+        deleted: false,
+        delete_error: error?.message || String(error)
+      });
+
+      return {
+        attempted: true,
+        deleted: false,
+        error: error?.message || String(error)
+      };
+    }
+  }
+
+  async listChatSessions(session, { signal } = {}) {
+    const baseUrl = stripTrailingSlash(session?.transport?.baseUrl || this.config.deepSeekBaseUrl);
+    const response = await this.fetch(`${baseUrl}${FETCH_CHAT_SESSIONS_PATH}`, {
+      method: 'GET',
+      headers: buildHeaders(session),
+      signal: createRequestSignal({
+        signal,
+        timeoutMs: this.config.upstreamTimeoutMs
+      })
+    });
+
+    const payload = await parseDeepSeekJsonResponse(
+      response,
+      'DeepSeek chat session listing failed.'
+    );
+
+    const bizData = payload?.data?.biz_data || {};
+    return {
+      sessions: Array.isArray(bizData.chat_sessions) ? bizData.chat_sessions : [],
+      hasMore: Boolean(bizData.has_more)
+    };
+  }
+
+  async cleanupChatSessions({
+    session,
+    scope = 'all',
+    dryRun = false,
+    keepRecent = 0,
+    maxDelete = 200
+  }) {
+    const trackedEntries = await this.pendingChatSessionStore.list();
+    const trackedIds = new Set(trackedEntries.map((entry) => entry.id));
+    const failures = [];
+    const deletedIds = [];
+    const skippedIds = [];
+    const seenIds = new Set();
+    let candidateCount = 0;
+    let fetchedCount = 0;
+    let passes = 0;
+    let hasMore = false;
+
+    if (scope === 'tracked') {
+      const candidates = trackedEntries.slice(0, maxDelete);
+      candidateCount = candidates.length;
+
+      for (const entry of candidates) {
+        if (dryRun) {
+          skippedIds.push(entry.id);
+          continue;
+        }
+
+        const result = await this.deleteChatSession(session, entry.id);
+        if (result.deleted) {
+          deletedIds.push(entry.id);
+          continue;
+        }
+
+        failures.push({
+          id: entry.id,
+          error: result.error || result.statusCode || 'delete_failed'
+        });
+      }
+
+      return {
+        scope,
+        dry_run: dryRun,
+        keep_recent: 0,
+        max_delete: maxDelete,
+        fetched_count: trackedEntries.length,
+        candidate_count: candidateCount,
+        deleted_count: deletedIds.length,
+        skipped_count: skippedIds.length,
+        failure_count: failures.length,
+        failures,
+        tracked_remaining_count: (await this.pendingChatSessionStore.list()).length
+      };
+    }
+
+    while (deletedIds.length + skippedIds.length < maxDelete && passes < 20) {
+      passes += 1;
+      const page = await this.listChatSessions(session);
+      const sessions = page.sessions || [];
+      hasMore = page.hasMore;
+      fetchedCount += sessions.length;
+
+      if (!sessions.length) {
+        break;
+      }
+
+      const protectedIds = new Set(sessions.slice(0, keepRecent).map((item) => item.id));
+      const candidates = sessions.filter((item) => !protectedIds.has(item.id));
+      const uniqueCandidates = candidates.filter((item) => {
+        if (seenIds.has(item.id)) {
+          return false;
+        }
+
+        seenIds.add(item.id);
+        return true;
+      });
+
+      if (!uniqueCandidates.length) {
+        break;
+      }
+
+      const batch = uniqueCandidates.slice(0, maxDelete - deletedIds.length - skippedIds.length);
+      candidateCount += batch.length;
+
+      for (const item of batch) {
+        if (dryRun) {
+          skippedIds.push(item.id);
+          continue;
+        }
+
+        const result = await this.deleteChatSession(session, item.id);
+        if (result.deleted) {
+          deletedIds.push(item.id);
+          continue;
+        }
+
+        failures.push({
+          id: item.id,
+          error: result.error || result.statusCode || 'delete_failed'
+        });
+      }
+
+      if (dryRun) {
+        break;
+      }
+    }
+
+    return {
+      scope,
+      dry_run: dryRun,
+      keep_recent: keepRecent,
+      max_delete: maxDelete,
+      fetched_count: fetchedCount,
+      candidate_count: candidateCount,
+      deleted_count: deletedIds.length,
+      skipped_count: skippedIds.length,
+      failure_count: failures.length,
+      failures,
+      has_more: hasMore,
+      tracked_remaining_count: (await this.pendingChatSessionStore.list()).length
+    };
   }
 }
 
@@ -304,6 +542,16 @@ async function* createTrackedTextStream(stream, { trace, traceStore }) {
   }
 }
 
+async function* createManagedTextStream(stream, { onClose } = {}) {
+  try {
+    for await (const chunk of stream) {
+      yield chunk;
+    }
+  } finally {
+    void onClose?.();
+  }
+}
+
 function buildHeaders(session, extraHeaders = {}) {
   return {
     ...session.transport.headers,
@@ -322,6 +570,18 @@ function createRequestSignal({ signal, timeoutMs }) {
   }
 
   return AbortSignal.any([signal, timeoutSignal]);
+}
+
+function createCleanupTask(task) {
+  let promise = null;
+
+  return () => {
+    if (!promise) {
+      promise = Promise.resolve().then(task);
+    }
+
+    return promise;
+  };
 }
 
 async function parseDeepSeekJsonResponse(response, fallbackMessage) {
@@ -483,4 +743,20 @@ function createStreamEventError(event, { fallbackStatusCode, fallbackCode, fallb
 function truncate(value, maxLength) {
   const text = String(value || '');
   return text.length <= maxLength ? text : `${text.slice(0, maxLength)}...`;
+}
+
+function parseJson(text) {
+  try {
+    return text ? JSON.parse(text) : null;
+  } catch {
+    return null;
+  }
+}
+
+function isDeepSeekSuccessPayload(payload) {
+  if (!payload) {
+    return true;
+  }
+
+  return (payload.code ?? 0) === 0 && (payload.data?.biz_code ?? 0) === 0;
 }

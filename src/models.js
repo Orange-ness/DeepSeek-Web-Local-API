@@ -65,6 +65,13 @@ export const autoLoginSchema = z.object({
   }
 });
 
+export const cleanupSessionsSchema = z.object({
+  scope: z.enum(['tracked', 'all']).optional().default('all'),
+  dry_run: z.boolean().optional().default(false),
+  keep_recent: z.number().int().min(0).optional().default(0),
+  max_delete: z.number().int().positive().optional().default(200)
+}).strict();
+
 const MODEL_ALIASES = new Map([
   ['deepseek-web-chat', { publicModel: 'deepseek-web-chat', thinkingEnabled: false }],
   ['deepseek-chat', { publicModel: 'deepseek-web-chat', thinkingEnabled: false }],
@@ -110,6 +117,14 @@ export function resolveModel(model) {
   }
 
   return resolved;
+}
+
+export function parseCleanupSessions(payload) {
+  try {
+    return cleanupSessionsSchema.parse(payload || {});
+  } catch (error) {
+    throw new BadRequestError('Invalid cleanup payload.', error.issues ?? error.message);
+  }
 }
 
 export function normalizeMessageContent(content) {

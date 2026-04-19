@@ -1,6 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { flattenMessagesToPrompt, parseChatCompletionRequest, resolveModel } from '../src/models.js';
+import {
+  flattenMessagesToPrompt,
+  parseChatCompletionRequest,
+  parseCleanupSessions,
+  resolveModel
+} from '../src/models.js';
 
 test('parseChatCompletionRequest normalizes text arrays', () => {
   const parsed = parseChatCompletionRequest({
@@ -57,4 +62,17 @@ test('flattenMessagesToPrompt keeps role order deterministic', () => {
   assert.match(prompt, /<｜User｜>Explain SSE\./);
   assert.match(prompt, /<｜Assistant｜>SSE streams events\.<｜end▁of▁sentence｜>/);
   assert.match(prompt, /<｜User｜>In one sentence\./);
+});
+
+test('parseCleanupSessions applies defaults and validates supported scopes', () => {
+  assert.deepEqual(parseCleanupSessions({}), {
+    scope: 'all',
+    dry_run: false,
+    keep_recent: 0,
+    max_delete: 200
+  });
+
+  assert.throws(() => {
+    parseCleanupSessions({ scope: 'invalid' });
+  });
 });

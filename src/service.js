@@ -2,6 +2,7 @@ import { AsyncSemaphore } from './queue.js';
 import { AuthenticationRequiredError, UpstreamError } from './errors.js';
 import {
   flattenMessagesToPrompt,
+  parseCleanupSessions,
   parseAutoLogin,
   parseChatCompletionRequest,
   parsePasswordLogin,
@@ -110,6 +111,61 @@ export class DeepSeekApiService {
 
   async logout() {
     return this.sessionManager.logout();
+  }
+
+  async cleanupSessions(payload = {}) {
+    const parsed = parseCleanupSessions(payload);
+    const session = await this.ensureAuthenticated({ allowAutoLogin: true });
+
+    return this.queue.run(() =>
+      this.client.cleanupChatSessions({
+        session,
+        scope: parsed.scope,
+        dryRun: parsed.dry_run,
+        keepRecent: parsed.keep_recent,
+        maxDelete: parsed.max_delete
+      })
+    );
+  }
+
+  async cleanupTrackedStartupSessions() {
+    let session;
+
+    try {
+      session = await this.sessionManager.requireSession();
+    } catch {
+      if (!this.sessionManager.hasConfiguredCredentials?.()) {
+        return {
+          scope: 'tracked',
+          skipped: true,
+          reason: 'no_usable_session'
+        };
+      }
+
+      try {
+        await this.sessionManager.loginAuto({
+          force: true,
+          browserFallback: false
+        });
+        session = await this.sessionManager.requireSession();
+      } catch {
+        return {
+          scope: 'tracked',
+          skipped: true,
+          reason: 'startup_login_failed'
+        };
+      }
+    }
+
+    return this.queue.run(() =>
+      this.client.cleanupChatSessions({
+        session,
+        scope: 'tracked',
+        dryRun: false,
+        keepRecent: 0,
+        maxDelete: 200
+      })
+    );
   }
 
   async getMetrics() {

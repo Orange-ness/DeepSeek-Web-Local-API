@@ -81,3 +81,28 @@ test('createDeepSeekDeltaAssembler ignores thinking deltas until response conten
     '!'
   );
 });
+
+test('createDeepSeekDeltaAssembler reads fragment-based DeepSeek payloads', () => {
+  const assemble = createDeepSeekDeltaAssembler();
+
+  assert.equal(
+    assemble({
+      v: {
+        response: {
+          fragments: [{ id: 2, type: 'RESPONSE', content: 'Everything' }]
+        }
+      }
+    }),
+    'Everything'
+  );
+
+  assert.equal(
+    assemble({ p: 'response/fragments/-1/content', o: 'APPEND', v: ' works' }),
+    ' works'
+  );
+
+  assert.equal(
+    assemble({ v: '.' }),
+    '.'
+  );
+});

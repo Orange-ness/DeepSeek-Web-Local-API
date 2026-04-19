@@ -10,6 +10,7 @@ const DEFAULT_QUEUE_TIMEOUT_MS = 30 * 1000;
 const DEFAULT_MAX_QUEUE_SIZE = 100;
 const DEFAULT_CHAT_MAX_ATTEMPTS = 3;
 const DEFAULT_RATE_LIMIT_RETRY_DELAY_MS = 1500;
+const DEFAULT_DELETE_CHAT_SESSION_TIMEOUT_MS = 3000;
 
 export function resolveConfig(env = process.env) {
   const cwd = process.cwd();
@@ -26,6 +27,11 @@ export function resolveConfig(env = process.env) {
     deepSeekSignInUrl: env.DEEPSEEK_SIGN_IN_URL || 'https://chat.deepseek.com/sign_in',
     deepSeekOrigin: env.DEEPSEEK_ORIGIN || 'https://chat.deepseek.com',
     deepSeekDsPowResponse: env.DEEPSEEK_DS_POW_RESPONSE || '',
+    deleteChatSessionAfterCompletion: parseBoolean(env.DELETE_CHAT_SESSION_AFTER_COMPLETION, true),
+    deleteChatSessionTimeoutMs: parsePositiveInt(
+      env.DELETE_CHAT_SESSION_TIMEOUT_MS,
+      DEFAULT_DELETE_CHAT_SESSION_TIMEOUT_MS
+    ),
     upstreamConcurrency: parsePositiveInt(env.UPSTREAM_CONCURRENCY, 1),
     chatMaxAttempts: parsePositiveInt(env.CHAT_MAX_ATTEMPTS, DEFAULT_CHAT_MAX_ATTEMPTS),
     rateLimitRetryDelayMs: parsePositiveInt(env.RATE_LIMIT_RETRY_DELAY_MS, DEFAULT_RATE_LIMIT_RETRY_DELAY_MS),
@@ -51,4 +57,21 @@ function parsePositiveInt(value, fallback) {
   }
 
   return parsed;
+}
+
+function parseBoolean(value, fallback) {
+  if (value === undefined || value === null || value === '') {
+    return fallback;
+  }
+
+  const normalized = String(value).trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(normalized)) {
+    return true;
+  }
+
+  if (['0', 'false', 'no', 'off'].includes(normalized)) {
+    return false;
+  }
+
+  return fallback;
 }

@@ -178,8 +178,91 @@ test('upstream trace endpoints expose trace ids from chat completions', async ()
   await app.close();
 });
 
-function buildTestApp({ errorStatus = null } = {}) {
+test('chat completions delete upstream chat sessions after the reply', async () => {
+  const app = buildTestApp();
+
+  await app.ready();
+  await app.inject({
+    method: 'POST',
+    url: '/v1/chat/completions',
+    payload: {
+      model: 'deepseek-web-chat',
+      messages: [{ role: 'user', content: 'Hello' }]
+    }
+  });
+
+  await waitFor(() =>
+    app.requestLog.some((entry) =>
+      entry.url === `${app.testBaseUrl}/chat_session/delete` &&
+      entry.method === 'POST' &&
+      entry.body === JSON.stringify({ chat_session_id: 'session-123' })
+    )
+  );
+
+  await app.close();
+});
+
+test('manual cleanup endpoint deletes remote chat sessions', async () => {
+  const app = buildTestApp();
+
+  await app.ready();
+  const response = await app.inject({
+    method: 'POST',
+    url: '/debug/cleanup-sessions',
+    payload: {
+      scope: 'all',
+      keep_recent: 1,
+      max_delete: 10
+    }
+  });
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.json().scope, 'all');
+  assert.equal(response.json().deleted_count, 2);
+  assert.equal(response.json().keep_recent, 1);
+  assert.equal(app.remoteSessions.length, 1);
+
+  await app.close();
+});
+
+test('startup cleanup deletes tracked orphan sessions only', async () => {
+  const app = buildTestApp({
+    trackedEntries: [
+      { id: 'tracked-orphan-1', created_at: new Date().toISOString(), source: 'api' },
+      { id: 'tracked-orphan-2', created_at: new Date().toISOString(), source: 'api' }
+    ],
+    remoteSessions: [
+      { id: 'tracked-orphan-1', seq_id: 4, title: 'Tracked orphan one', title_type: 'SYSTEM', updated_at: 4 },
+      { id: 'tracked-orphan-2', seq_id: 3, title: 'Tracked orphan two', title_type: 'SYSTEM', updated_at: 3 },
+      { id: 'keep-manual-1', seq_id: 2, title: 'Keep me', title_type: 'SYSTEM', updated_at: 2 }
+    ]
+  });
+
+  await app.ready();
+  const summary = await app.deepSeekService.cleanupTrackedStartupSessions();
+
+  assert.equal(summary.scope, 'tracked');
+  assert.equal(summary.deleted_count, 2);
+  assert.equal(summary.tracked_remaining_count, 0);
+  assert.deepEqual(
+    app.remoteSessions.map((item) => item.id),
+    ['keep-manual-1']
+  );
+
+  await app.close();
+});
+
+function buildTestApp({ errorStatus = null, trackedEntries, remoteSessions } = {}) {
   const baseUrl = 'https://fake.deepseek.local/api/v0';
+  const requestLog = [];
+  const pendingEntries = [...(trackedEntries || [])];
+  const upstreamSessions = [
+    ...(remoteSessions || [
+      { id: 'keep-recent-1', seq_id: 3, title: 'Keep recent', title_type: 'SYSTEM', updated_at: 3 },
+      { id: 'cleanup-old-1', seq_id: 2, title: 'Cleanup one', title_type: 'SYSTEM', updated_at: 2 },
+      { id: 'cleanup-old-2', seq_id: 1, title: 'Cleanup two', title_type: 'SYSTEM', updated_at: 1 }
+    ])
+  ];
   const config = resolveConfig({
     HOST: '127.0.0.1',
     PORT: '8787',
@@ -197,6 +280,7 @@ function buildTestApp({ errorStatus = null } = {}) {
     transport: {
       baseUrl,
       createChatSessionUrl: `${baseUrl}/chat_session/create`,
+      deleteChatSessionUrl: `${baseUrl}/chat_session/delete`,
       chatCompletionUrl: `${baseUrl}/chat/completion`,
       headers: {
         accept: '*/*',
@@ -258,6 +342,7 @@ function buildTestApp({ errorStatus = null } = {}) {
           captured_at: null,
           base_url: baseUrl,
           create_chat_session_url: `${baseUrl}/chat_session/create`,
+          delete_chat_session_url: `${baseUrl}/chat_session/delete`,
           chat_completion_url: `${baseUrl}/chat/completion`,
           header_keys: ['accept', 'content-type', 'origin', 'referer', 'user-agent']
         }
@@ -274,20 +359,52 @@ function buildTestApp({ errorStatus = null } = {}) {
     }
   };
 
-  return buildApp({
+  const pendingChatSessionStore = {
+    async list() {
+      return pendingEntries.map((entry) => ({ ...entry }));
+    },
+    async add(entry) {
+      const existingIndex = pendingEntries.findIndex((item) => item.id === entry.id);
+      if (existingIndex === -1) {
+        pendingEntries.push({ ...entry });
+      } else {
+        pendingEntries[existingIndex] = { ...pendingEntries[existingIndex], ...entry };
+      }
+      return entry;
+    },
+    async remove(id) {
+      const index = pendingEntries.findIndex((entry) => entry.id === id);
+      if (index >= 0) {
+        pendingEntries.splice(index, 1);
+      }
+      return pendingEntries;
+    }
+  };
+
+  const app = buildApp({
     config,
     sessionManager,
     client: new DeepSeekWebClient(config, {
-      fetchImpl: createFakeFetch({ baseUrl, errorStatus }),
+      fetchImpl: createFakeFetch({ baseUrl, errorStatus, requestLog, remoteSessions: upstreamSessions }),
+      pendingChatSessionStore,
       powResponseBuilder: async () => 'fake-pow'
     })
   });
+
+  app.requestLog = requestLog;
+  app.testBaseUrl = baseUrl;
+  app.remoteSessions = upstreamSessions;
+  app.pendingEntries = pendingEntries;
+  return app;
 }
 
-function createFakeFetch({ baseUrl, errorStatus }) {
+function createFakeFetch({ baseUrl, errorStatus, requestLog, remoteSessions }) {
   return async (input, init = {}) => {
     const url = typeof input === 'string' ? input : input.toString();
     const method = init.method || 'GET';
+    const body = typeof init.body === 'string' ? init.body : null;
+
+    requestLog.push({ url, method, body });
 
     if (url === 'https://fake.deepseek.local/') {
       return new Response('ok', {
@@ -297,7 +414,48 @@ function createFakeFetch({ baseUrl, errorStatus }) {
     }
 
     if (url === `${baseUrl}/chat_session/create` && method === 'POST') {
+      if (!remoteSessions.some((item) => item.id === 'session-123')) {
+        remoteSessions.unshift({
+          id: 'session-123',
+          seq_id: 999,
+          title: 'Session created by API',
+          title_type: 'SYSTEM',
+          updated_at: 999
+        });
+      }
+
       return new Response(JSON.stringify({ data: { biz_data: { id: 'session-123' } } }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      });
+    }
+
+    if (url === `${baseUrl}/chat_session/fetch_page?lte_cursor.pinned=false` && method === 'GET') {
+      return new Response(JSON.stringify({
+        code: 0,
+        msg: '',
+        data: {
+          biz_code: 0,
+          biz_msg: '',
+          biz_data: {
+            chat_sessions: remoteSessions,
+            has_more: false
+          }
+        }
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      });
+    }
+
+    if (url === `${baseUrl}/chat_session/delete` && method === 'POST') {
+      const payload = body ? JSON.parse(body) : {};
+      const index = remoteSessions.findIndex((item) => item.id === payload.chat_session_id);
+      if (index >= 0) {
+        remoteSessions.splice(index, 1);
+      }
+
+      return new Response(JSON.stringify({ code: 0, data: { biz_code: 0 } }), {
         status: 200,
         headers: { 'content-type': 'application/json' }
       });
@@ -354,3 +512,17 @@ function createFakeFetch({ baseUrl, errorStatus }) {
 }
 
 const encoder = new TextEncoder();
+
+async function waitFor(predicate, { timeoutMs = 1000, intervalMs = 10 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    if (predicate()) {
+      return;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+
+  throw new Error('Timed out while waiting for the expected condition.');
+}

@@ -12,6 +12,7 @@ export function createDefaultTransportTemplate(config, overrides = {}) {
     capturedAt: overrides.capturedAt || null,
     baseUrl,
     createChatSessionUrl: overrides.createChatSessionUrl || `${baseUrl}/chat_session/create`,
+    deleteChatSessionUrl: overrides.deleteChatSessionUrl || `${baseUrl}/chat_session/delete`,
     chatCompletionUrl: overrides.chatCompletionUrl || `${baseUrl}/chat/completion`,
     headers: {
       accept: '*/*',

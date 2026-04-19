@@ -40,6 +40,7 @@ export class DeepSeekSessionManager {
             captured_at: session.transport.capturedAt || null,
             base_url: session.transport.baseUrl || null,
             create_chat_session_url: session.transport.createChatSessionUrl || null,
+            delete_chat_session_url: session.transport.deleteChatSessionUrl || null,
             chat_completion_url: session.transport.chatCompletionUrl || null,
             header_keys: Object.keys(session.transport.headers || {}).sort()
           }
@@ -181,9 +182,27 @@ export class DeepSeekSessionManager {
 
   async runAutomatedPasswordFlow(credentials, { mode }) {
     return this.withBrowserContext({ headless: true }, async ({ context, page, capture }) => {
-      await page.goto(this.config.deepSeekSignInUrl, { waitUntil: 'domcontentloaded' });
+      await this.openSignInPage(page);
+      await dismissCookieBanner(page);
+
+      const existingSession = await this.readAuthenticatedSessionIfAvailable(context, page, capture, mode);
+      if (existingSession) {
+        await this.store.save(existingSession);
+        return formatSessionStatus(existingSession, {
+          hasConfiguredCredentials: this.hasConfiguredCredentials()
+        });
+      }
+
       await this.fillCredentials(page, credentials);
+      const loginResponsePromise = waitForLoginApiResponse(page, Math.min(15_000, this.config.loginTimeoutMs / 3));
       await this.submitLogin(page);
+      const loginResult = await loginResponsePromise;
+      if (loginResult && !loginResult.success) {
+        throw new BadRequestError(
+          'DeepSeek password login was rejected. The account may require browser fallback or social login.',
+          loginResult
+        );
+      }
 
       const session = await this.waitForAuthenticatedSession(
         context,
@@ -202,7 +221,8 @@ export class DeepSeekSessionManager {
 
   async runVisibleLoginFlow({ mode, credentials }) {
     return this.withBrowserContext({ headless: false }, async ({ context, page, capture }) => {
-      await page.goto(this.config.deepSeekSignInUrl, { waitUntil: 'domcontentloaded' });
+      await this.openSignInPage(page);
+      await dismissCookieBanner(page);
 
       if (credentials) {
         await this.fillCredentials(page, credentials, { bestEffort: true });
@@ -248,9 +268,11 @@ export class DeepSeekSessionManager {
     await fillFirstAvailable(
       page,
       [
+        'input[placeholder="Phone number / email address"]',
         'input[type="email"]',
         'input[name="email"]',
-        'input[autocomplete="username"]'
+        'input[autocomplete="username"]',
+        'input[type="text"]'
       ],
       email,
       options
@@ -259,6 +281,7 @@ export class DeepSeekSessionManager {
     await fillFirstAvailable(
       page,
       [
+        'input[placeholder="Password"]',
         'input[type="password"]',
         'input[name="password"]',
         'input[autocomplete="current-password"]'
@@ -270,6 +293,7 @@ export class DeepSeekSessionManager {
 
   async submitLogin(page, { optional = false } = {}) {
     const selectors = [
+      'button[role="button"]:has-text("Log in")',
       'button[type="submit"]',
       'button:has-text("Sign in")',
       'button:has-text("Log in")',
@@ -310,10 +334,36 @@ export class DeepSeekSessionManager {
         };
       }
 
-      await page.waitForTimeout(1000);
+      await page.waitForTimeout(500);
     }
 
     throw new LoginTimeoutError();
+  }
+
+  async readAuthenticatedSessionIfAvailable(context, page, capture, mode) {
+    const snapshot = await readBrowserSnapshot(page, context);
+    if (!snapshot.authToken || !snapshot.cookieHeader) {
+      return null;
+    }
+
+    return {
+      authenticated: true,
+      lastLoginMode: mode,
+      updatedAt: new Date().toISOString(),
+      expiresAt: decodeTokenExpiry(snapshot.authToken),
+      authToken: snapshot.authToken,
+      cookieHeader: snapshot.cookieHeader,
+      userAgent: snapshot.userAgent || DEFAULT_USER_AGENT,
+      localStorage: snapshot.localStorage,
+      transport: capture.toTemplate(snapshot)
+    };
+  }
+
+  async openSignInPage(page) {
+    await page.goto(this.config.deepSeekOrigin, { waitUntil: 'domcontentloaded' }).catch(() => {});
+    await page.waitForTimeout(800);
+    await page.goto(this.config.deepSeekSignInUrl, { waitUntil: 'domcontentloaded' });
+    await page.waitForTimeout(1500);
   }
 }
 
@@ -370,6 +420,7 @@ async function fillFirstAvailable(page, selectors, value, { bestEffort = false }
   for (const selector of selectors) {
     const locator = page.locator(selector).first();
     if ((await locator.count()) > 0) {
+      await locator.waitFor({ state: 'visible', timeout: 5_000 }).catch(() => {});
       await locator.fill(value);
       return true;
     }
@@ -498,4 +549,44 @@ function formatSessionStatus(session, { hasConfiguredCredentials = false } = {})
     updated_at: session?.updatedAt || null,
     transport_source: session?.transport?.source || null
   };
+}
+
+async function dismissCookieBanner(page) {
+  for (const label of ['Necessary cookies only', 'Accept all cookies']) {
+    const button = page.getByRole('button', { name: label }).first();
+    if ((await button.count()) > 0) {
+      await button.click().catch(() => {});
+      await page.waitForTimeout(300);
+      return true;
+    }
+  }
+
+  return false;
+}
+
+async function waitForLoginApiResponse(page, timeoutMs) {
+  try {
+    const response = await page.waitForResponse(
+      (entry) => entry.url().includes('/api/v0/users/login'),
+      { timeout: timeoutMs }
+    );
+    const text = await response.text().catch(() => '');
+    let payload = null;
+
+    try {
+      payload = text ? JSON.parse(text) : null;
+    } catch {
+      payload = null;
+    }
+
+    const success = response.ok && (payload?.code ?? 0) === 0 && (payload?.data?.biz_code ?? 0) === 0;
+    return {
+      success,
+      status: response.status(),
+      upstream_code: payload?.data?.biz_code ?? payload?.code ?? null,
+      upstream_message: payload?.data?.biz_msg || payload?.msg || null
+    };
+  } catch {
+    return null;
+  }
 }
