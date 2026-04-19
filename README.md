@@ -1,4 +1,4 @@
-<img width="1409" height="232" alt="image" src="https://github.com/user-attachments/assets/ebafb64e-32f4-4de9-bcf2-afd973cd60bb" /># DeepSeek Web Local API
+# DeepSeek Web Local API
 
 A local Node.js server that exposes an OpenAI-compatible API on top of `https://chat.deepseek.com`.
 
