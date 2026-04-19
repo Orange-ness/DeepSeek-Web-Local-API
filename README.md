@@ -1,4 +1,4 @@
-# DeepSeek Web Local API
+<img width="1409" height="232" alt="image" src="https://github.com/user-attachments/assets/ebafb64e-32f4-4de9-bcf2-afd973cd60bb" /># DeepSeek Web Local API
 
 A local Node.js server that exposes an OpenAI-compatible API on top of `https://chat.deepseek.com`.
 
@@ -113,7 +113,7 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 
 ## Using with OpenAI-Compatible Clients
 
-You can secure your local proxy and use it with any app/plugin that supports custom OpenAI endpoints (like UI dashboards, IDE extensions, CLI tools).
+You can add an API key to your local proxy and then use it with any app/plugin that supports custom OpenAI endpoints (like UI dashboards, IDE extensions, CLI tools).
 
 1. Open your `.env` file and set a custom API key:
    ```env
