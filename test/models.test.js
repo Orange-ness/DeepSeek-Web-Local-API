@@ -24,6 +24,41 @@ test('parseChatCompletionRequest normalizes text arrays', () => {
   assert.equal(parsed.messages[0].content, 'hello world');
 });
 
+test('parseChatCompletionRequest accepts image and file content parts', () => {
+  const parsed = parseChatCompletionRequest({
+    model: 'deepseek-web-chat',
+    messages: [
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'Read these attachments.' },
+          {
+            type: 'image_url',
+            image_url: {
+              url: '/tmp/example.png',
+              filename: 'example.png'
+            }
+          },
+          {
+            type: 'input_file',
+            input_file: {
+              path: './notes.txt',
+              filename: 'notes.txt'
+            }
+          }
+        ]
+      }
+    ]
+  });
+
+  assert.equal(parsed.messages[0].content, 'Read these attachments.');
+  assert.equal(parsed.messages[0].content_parts[1].type, 'image_url');
+  assert.equal(parsed.messages[0].content_parts[2].type, 'input_file');
+  assert.equal(parsed.attachments.length, 2);
+  assert.equal(parsed.attachments[0].file_name, 'example.png');
+  assert.equal(parsed.attachments[1].source_type, 'path');
+});
+
 test('parseChatCompletionRequest accepts common OpenAI-compatible extra fields', () => {
   const parsed = parseChatCompletionRequest({
     model: 'deepseek-web-chat',
@@ -79,7 +114,7 @@ test('parseChatCompletionRequest rejects unsupported message content', () => {
       messages: [
         {
           role: 'user',
-          content: [{ type: 'image_url', image_url: { url: 'x' } }]
+          content: [{ type: 'audio_url', audio_url: { url: 'x' } }]
         }
       ]
     });
@@ -172,6 +207,22 @@ test('flattenMessagesToPrompt keeps role order deterministic', () => {
   assert.match(prompt, /<｜User｜>Explain SSE\./);
   assert.match(prompt, /<｜Assistant｜>SSE streams events\.<｜end▁of▁sentence｜>/);
   assert.match(prompt, /<｜User｜>In one sentence\./);
+});
+
+test('flattenMessagesToPrompt inserts attachment markers', () => {
+  const prompt = flattenMessagesToPrompt([
+    {
+      role: 'user',
+      content: 'Describe this.',
+      content_parts: [
+        { type: 'text', text: 'Describe this.' },
+        { type: 'image_url', image_url: { url: '/tmp/cat.png', filename: 'cat.png' } }
+      ]
+    }
+  ]);
+
+  assert.match(prompt, /Describe this\./);
+  assert.match(prompt, /\[Attached image: cat\.png\]/);
 });
 
 test('parseCleanupSessions applies defaults and validates supported scopes', () => {

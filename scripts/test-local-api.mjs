@@ -11,6 +11,8 @@ let debugUpstream = false;
 let jsonMode = false;
 let model = process.env.DEEPSEEK_LOCAL_MODEL || 'deepseek-web-chat';
 let system = process.env.DEEPSEEK_LOCAL_SYSTEM || '';
+const inputFiles = [];
+const inputImages = [];
 const messageParts = [];
 
 for (let index = 0; index < args.length; index += 1) {
@@ -43,6 +45,24 @@ for (let index = 0; index < args.length; index += 1) {
     continue;
   }
 
+  if (arg === '--file') {
+    const value = args[index + 1];
+    if (value) {
+      inputFiles.push(value);
+      index += 1;
+    }
+    continue;
+  }
+
+  if (arg === '--image') {
+    const value = args[index + 1];
+    if (value) {
+      inputImages.push(value);
+      index += 1;
+    }
+    continue;
+  }
+
   if (arg === '--help' || arg === '-h') {
     printHelp();
     process.exit(0);
@@ -62,7 +82,30 @@ const messages = [];
 if (system) {
   messages.push({ role: 'system', content: system });
 }
-messages.push({ role: 'user', content: message });
+const userContentParts = [{ type: 'text', text: message }];
+
+for (const imagePath of inputImages) {
+  userContentParts.push({
+    type: 'image_url',
+    image_url: {
+      url: imagePath
+    }
+  });
+}
+
+for (const filePath of inputFiles) {
+  userContentParts.push({
+    type: 'input_file',
+    input_file: {
+      path: filePath
+    }
+  });
+}
+
+messages.push({
+  role: 'user',
+  content: userContentParts.length === 1 ? message : userContentParts
+});
 
 const payload = {
   model,
@@ -243,12 +286,14 @@ function handleSseBlock(block) {
 function printHelp() {
   console.log(`
 Usage:
-  npm run smoke -- [--stream] [--json] [--debug-upstream] [--model MODEL] [--system PROMPT] "Your message"
+  npm run smoke -- [--stream] [--json] [--debug-upstream] [--model MODEL] [--system PROMPT] [--image PATH] [--file PATH] "Your message"
 
 Examples:
   npm run smoke -- "Say hello"
   npm run smoke -- --stream --model deepseek-web-think "Explain SSE in one sentence"
   npm run smoke -- --json "Return { \\"status\\": \\"ok\\" }"
+  npm run smoke -- --image ./scan.png "What text is in this image?"
+  npm run smoke -- --file ./notes.txt "Summarize the attached file"
 
 Environment variables:
   LOCAL_API_BASE_URL   Default: http://127.0.0.1:8787

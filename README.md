@@ -6,6 +6,7 @@ A local Node.js server that exposes an OpenAI-compatible API on top of `https://
 
 - OpenAI-compatible `POST /v1/chat/completions` with regular and streaming SSE responses
 - OpenAI-compatible function calling emulation with `tools`, `tool_choice`, and `role: tool`
+- File attachment support for parseable DeepSeek Web files, including OCR-friendly images
 - Password-first auto login with browser fallback
 - Persistent local DeepSeek session reuse
 - Built-in PoW challenge solving for `chat.deepseek.com`
@@ -141,6 +142,90 @@ curl http://127.0.0.1:8787/v1/chat/completions \
   }'
 ```
 
+File attachment with a local text file:
+
+```bash
+curl http://127.0.0.1:8787/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{
+    "model": "deepseek-web-chat",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {"type":"text","text":"What animal is mentioned in the attached file?"},
+          {
+            "type":"input_file",
+            "input_file": {
+              "path": "./notes.txt"
+            }
+          }
+        ]
+      }
+    ]
+  }'
+```
+
+Image attachment with a local path:
+
+```bash
+curl http://127.0.0.1:8787/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{
+    "model": "deepseek-web-chat",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {"type":"text","text":"What text is visible in this image?"},
+          {
+            "type":"image_url",
+            "image_url": {
+              "url": "./scan.png"
+            }
+          }
+        ]
+      }
+    ]
+  }'
+```
+
+Data URL image attachment:
+
+```json
+{
+  "model": "deepseek-web-chat",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        { "type": "text", "text": "Summarize this image." },
+        {
+          "type": "image_url",
+          "image_url": {
+            "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAA..."
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+Supported attachment inputs:
+
+- `image_url.url`: `http(s)://`, `data:`, `file://`, absolute paths, or relative local paths
+- `input_file.path`: local file path
+- `input_file.url`: remote URL or `file://` URL
+- `input_file.data` / `input_file.file_data`: base64 or `data:` URL
+
+Important limitation:
+
+- DeepSeek Web currently treats attachments through its file extraction pipeline.
+- That means text files work well, and images work when DeepSeek can extract usable text or OCR content from them.
+- Pure vision-style image understanding is not guaranteed on the current web flow or current account/model configuration.
+- If DeepSeek ends parsing with statuses like `CONTENT_EMPTY`, the local API returns a clear `400` instead of forwarding an opaque upstream `invalid ref file id`.
+
 ## Using with OpenAI-Compatible Clients
 
 You can add an API key to your local proxy and then use it with any app/plugin that supports custom OpenAI endpoints (like UI dashboards, IDE extensions, CLI tools).
@@ -177,6 +262,13 @@ JSON-mode smoke test:
 
 ```bash
 npm run smoke -- --json "Return {\"status\":\"ok\"}"
+```
+
+Attachment smoke tests:
+
+```bash
+npm run smoke -- --file ./notes.txt "Summarize the attached file"
+npm run smoke -- --image ./scan.png "What text is in this image?"
 ```
 
 Full verification:

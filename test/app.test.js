@@ -40,6 +40,87 @@ test('non-stream chat completion buffers upstream SSE', async () => {
   await app.close();
 });
 
+test('chat completion uploads parseable file attachments and forwards ref_file_ids', async () => {
+  const app = buildTestApp();
+  const textDataUrl = `data:text/plain;base64,${Buffer.from('The animal is a cat.', 'utf8').toString('base64')}`;
+
+  await app.ready();
+  const response = await app.inject({
+    method: 'POST',
+    url: '/v1/chat/completions',
+    payload: {
+      model: 'deepseek-web-chat',
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'What animal is mentioned in the file?' },
+            {
+              type: 'input_file',
+              input_file: {
+                filename: 'note.txt',
+                file_data: textDataUrl
+              }
+            }
+          ]
+        }
+      ]
+    }
+  });
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.json().choices[0].message.content, 'Hello from the fake upstream');
+
+  const uploadRequest = app.requestLog.find((entry) => entry.url === `${app.testBaseUrl}/file/upload_file`);
+  assert.equal(Boolean(uploadRequest), true);
+  assert.match(String(uploadRequest.headers?.['content-type'] || ''), /multipart\/form-data/u);
+
+  const completionRequest = app.requestLog.find((entry) => entry.url === `${app.testBaseUrl}/chat/completion`);
+  assert.deepEqual(completionRequest.parsedBody?.ref_file_ids, ['file-1']);
+
+  await app.close();
+});
+
+test('chat completion fails early when DeepSeek cannot parse an attachment', async () => {
+  const app = buildTestApp({
+    uploadedFileFinalStatus: 'CONTENT_EMPTY'
+  });
+  const imageDataUrl = `data:image/png;base64,${Buffer.from('fake-image').toString('base64')}`;
+
+  await app.ready();
+  const response = await app.inject({
+    method: 'POST',
+    url: '/v1/chat/completions',
+    payload: {
+      model: 'deepseek-web-chat',
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'Describe this image.' },
+            {
+              type: 'image_url',
+              image_url: {
+                url: imageDataUrl,
+                filename: 'image.png'
+              }
+            }
+          ]
+        }
+      ]
+    }
+  });
+
+  assert.equal(response.statusCode, 400);
+  assert.match(response.json().error.message, /could not use attachment/i);
+  assert.equal(
+    app.requestLog.some((entry) => entry.url === `${app.testBaseUrl}/chat/completion`),
+    false
+  );
+
+  await app.close();
+});
+
 test('streaming chat completion emits OpenAI-style SSE', async () => {
   const app = buildTestApp();
 
@@ -388,7 +469,12 @@ test('startup cleanup deletes tracked orphan sessions only', async () => {
   await app.close();
 });
 
-function buildTestApp({ errorStatus = null, trackedEntries, remoteSessions } = {}) {
+function buildTestApp({
+  errorStatus = null,
+  trackedEntries,
+  remoteSessions,
+  uploadedFileFinalStatus = 'SUCCESS'
+} = {}) {
   const baseUrl = 'https://fake.deepseek.local/api/v0';
   const requestLog = [];
   const pendingEntries = [...(trackedEntries || [])];
@@ -521,7 +607,13 @@ function buildTestApp({ errorStatus = null, trackedEntries, remoteSessions } = {
     config,
     sessionManager,
     client: new DeepSeekWebClient(config, {
-      fetchImpl: createFakeFetch({ baseUrl, errorStatus, requestLog, remoteSessions: upstreamSessions }),
+      fetchImpl: createFakeFetch({
+        baseUrl,
+        errorStatus,
+        requestLog,
+        remoteSessions: upstreamSessions,
+        uploadedFileFinalStatus
+      }),
       pendingChatSessionStore,
       powResponseBuilder: async () => 'fake-pow'
     })
@@ -534,14 +626,24 @@ function buildTestApp({ errorStatus = null, trackedEntries, remoteSessions } = {
   return app;
 }
 
-function createFakeFetch({ baseUrl, errorStatus, requestLog, remoteSessions }) {
+function createFakeFetch({ baseUrl, errorStatus, requestLog, remoteSessions, uploadedFileFinalStatus }) {
+  const uploadedFiles = new Map();
+  let uploadedFileCount = 0;
+
   return async (input, init = {}) => {
     const url = typeof input === 'string' ? input : input.toString();
     const method = init.method || 'GET';
     const body = typeof init.body === 'string' ? init.body : null;
     const parsedBody = body ? safeJsonParse(body) : null;
+    const headers = normalizeHeaders(init.headers);
 
-    requestLog.push({ url, method, body });
+    requestLog.push({
+      url,
+      method,
+      body,
+      headers,
+      parsedBody
+    });
 
     if (url === 'https://fake.deepseek.local/') {
       return new Response('ok', {
@@ -593,6 +695,76 @@ function createFakeFetch({ baseUrl, errorStatus, requestLog, remoteSessions }) {
       }
 
       return new Response(JSON.stringify({ code: 0, data: { biz_code: 0 } }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      });
+    }
+
+    if (url === `${baseUrl}/file/upload_file` && method === 'POST') {
+      const fileId = `file-${++uploadedFileCount}`;
+      uploadedFiles.set(fileId, {
+        status: 'PENDING',
+        fetchCount: 0,
+        finalStatus: uploadedFileFinalStatus
+      });
+
+      return new Response(JSON.stringify({
+        code: 0,
+        msg: '',
+        data: {
+          biz_code: 0,
+          biz_msg: '',
+          biz_data: {
+            id: fileId,
+            status: 'PENDING',
+            file_name: extractMultipartFileName(init.body) || `upload-${uploadedFileCount}.txt`,
+            previewable: false,
+            file_size: 16,
+            token_usage: null,
+            error_code: null,
+            inserted_at: 1,
+            updated_at: 1
+          }
+        }
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      });
+    }
+
+    if (url.startsWith(`${baseUrl}/file/fetch_files?file_ids=`) && method === 'GET') {
+      const fileId = new URL(url).searchParams.get('file_ids');
+      const file = uploadedFiles.get(fileId);
+      if (!file) {
+        return new Response('missing file', { status: 404 });
+      }
+
+      file.fetchCount += 1;
+      file.status = file.fetchCount === 1 ? 'PARSING' : file.finalStatus;
+
+      return new Response(JSON.stringify({
+        code: 0,
+        msg: '',
+        data: {
+          biz_code: 0,
+          biz_msg: '',
+          biz_data: {
+            files: [
+              {
+                id: fileId,
+                status: file.status,
+                file_name: 'uploaded-file',
+                previewable: true,
+                file_size: 16,
+                token_usage: file.status === 'SUCCESS' ? 9 : 0,
+                error_code: null,
+                inserted_at: 1,
+                updated_at: 2
+              }
+            ]
+          }
+        }
+      }), {
         status: 200,
         headers: { 'content-type': 'application/json' }
       });
@@ -674,6 +846,27 @@ function createFakeFetch({ baseUrl, errorStatus, requestLog, remoteSessions }) {
 }
 
 const encoder = new TextEncoder();
+
+function normalizeHeaders(value) {
+  if (!value) {
+    return {};
+  }
+
+  if (typeof value.entries === 'function') {
+    return Object.fromEntries(value.entries());
+  }
+
+  return Object.fromEntries(Object.entries(value));
+}
+
+function extractMultipartFileName(body) {
+  if (!Buffer.isBuffer(body)) {
+    return null;
+  }
+
+  const match = body.toString('utf8', 0, Math.min(body.length, 1024)).match(/filename="([^"]+)"/u);
+  return match?.[1] || null;
+}
 
 function safeJsonParse(value) {
   try {

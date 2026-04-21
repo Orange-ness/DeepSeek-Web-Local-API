@@ -269,6 +269,7 @@ export class DeepSeekApiService {
           const openResult = await this.client.openChatStream({
             session,
             prompt,
+            attachments: request.attachments,
             thinkingEnabled: model.thinkingEnabled,
             temperature: request.temperature,
             maxTokens: request.max_tokens,
@@ -417,6 +418,7 @@ export class DeepSeekApiService {
         this.client.completeChat({
           session,
           prompt: finalPrompt,
+          attachments: request.attachments,
           thinkingEnabled: model.thinkingEnabled,
           temperature: request.temperature,
           maxTokens: request.max_tokens,
