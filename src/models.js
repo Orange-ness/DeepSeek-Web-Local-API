@@ -21,9 +21,32 @@ const textPartSchema = z.object({
   text: z.string()
 }).passthrough();
 
+const declaredFunctionSchema = z.object({
+  name: z.string().min(1),
+  description: z.string().optional(),
+  parameters: z.object({}).passthrough().optional()
+}).passthrough();
+
+const declaredToolSchema = z.object({
+  type: z.literal('function'),
+  function: declaredFunctionSchema
+}).passthrough();
+
+const assistantToolCallSchema = z.object({
+  id: z.string().optional(),
+  type: z.literal('function').optional().default('function'),
+  function: z.object({
+    name: z.string().min(1),
+    arguments: z.string()
+  }).passthrough()
+}).passthrough();
+
 const chatMessageSchema = z.object({
-  role: z.enum(['system', 'developer', 'user', 'assistant']),
-  content: z.union([z.string(), z.null(), z.array(textPartSchema).min(1)])
+  role: z.enum(['system', 'developer', 'user', 'assistant', 'tool']),
+  content: z.union([z.string(), z.null(), z.array(textPartSchema).min(1)]).optional().default(''),
+  name: z.string().optional(),
+  tool_call_id: z.string().optional(),
+  tool_calls: z.array(assistantToolCallSchema).optional()
 }).passthrough();
 
 const metadataValueSchema = z.union([z.string(), z.number(), z.boolean()]);
@@ -52,10 +75,23 @@ export const chatCompletionRequestSchema = z.object({
   reasoning_effort: z.string().optional(),
   service_tier: z.string().optional(),
   parallel_tool_calls: z.boolean().optional(),
-  tool_choice: z.union([z.string(), z.object({}).passthrough()]).optional(),
-  function_call: z.union([z.string(), z.object({}).passthrough()]).optional(),
-  tools: z.array(z.unknown()).optional(),
-  functions: z.array(z.unknown()).optional(),
+  tool_choice: z.union([
+    z.enum(['none', 'auto', 'required']),
+    z.object({
+      type: z.literal('function'),
+      function: z.object({
+        name: z.string().min(1)
+      }).passthrough()
+    }).passthrough()
+  ]).optional(),
+  function_call: z.union([
+    z.enum(['none', 'auto']),
+    z.object({
+      name: z.string().min(1)
+    }).passthrough()
+  ]).optional(),
+  tools: z.array(declaredToolSchema).optional(),
+  functions: z.array(declaredFunctionSchema).optional(),
   modalities: z.array(z.string()).optional(),
   audio: z.object({}).passthrough().optional(),
   prediction: z.object({}).passthrough().optional(),
@@ -108,13 +144,31 @@ const MODEL_ALIASES = new Map([
 export function parseChatCompletionRequest(payload) {
   try {
     const parsed = chatCompletionRequestSchema.parse(payload);
-    validateIgnoredChatFields(parsed);
+    const normalizedTools = normalizeDeclaredTools(parsed);
+    const normalizedToolChoice = normalizeToolChoice(parsed, normalizedTools);
+    validateIgnoredChatFields(parsed, normalizedTools, normalizedToolChoice);
     return {
       ...parsed,
       max_tokens: parsed.max_tokens ?? parsed.max_completion_tokens,
+      tools: normalizedTools,
+      tool_choice: normalizedToolChoice,
       messages: parsed.messages.map((message) => ({
         role: normalizeMessageRole(message.role),
-        content: normalizeMessageContent(message.content)
+        content: normalizeMessageContent(message.content),
+        ...(message.name ? { name: message.name } : {}),
+        ...(message.tool_call_id ? { tool_call_id: message.tool_call_id } : {}),
+        ...(message.tool_calls
+          ? {
+              tool_calls: message.tool_calls.map((toolCall) => ({
+                id: toolCall.id || null,
+                type: 'function',
+                function: {
+                  name: toolCall.function.name,
+                  arguments: toolCall.function.arguments
+                }
+              }))
+            }
+          : {})
       }))
     };
   } catch (error) {
@@ -171,17 +225,78 @@ function normalizeMessageRole(role) {
   return role === 'developer' ? 'system' : role;
 }
 
-function validateIgnoredChatFields(payload) {
+function normalizeDeclaredTools(payload) {
+  const declaredTools = Array.isArray(payload.tools) ? payload.tools : [];
+  const legacyFunctions = Array.isArray(payload.functions)
+    ? payload.functions.map((item) => ({
+        type: 'function',
+        function: item
+      }))
+    : [];
+  const tools = [...declaredTools, ...legacyFunctions].map((tool) => ({
+    type: 'function',
+    function: {
+      name: tool.function.name,
+      ...(tool.function.description ? { description: tool.function.description } : {}),
+      parameters: tool.function.parameters || { type: 'object', properties: {} }
+    }
+  }));
+  const names = new Set();
+
+  for (const tool of tools) {
+    if (names.has(tool.function.name)) {
+      throw new BadRequestError(`Duplicate tool name "${tool.function.name}" is not supported.`);
+    }
+
+    names.add(tool.function.name);
+  }
+
+  return tools;
+}
+
+function normalizeToolChoice(payload, tools) {
+  const toolNames = new Set(tools.map((tool) => tool.function.name));
+  let normalized = payload.tool_choice;
+
+  if (!normalized && payload.function_call) {
+    normalized =
+      typeof payload.function_call === 'string'
+        ? payload.function_call
+        : {
+            type: 'function',
+            function: {
+              name: payload.function_call.name
+            }
+          };
+  }
+
+  if (!normalized) {
+    return tools.length > 0 ? 'auto' : 'none';
+  }
+
+  if (typeof normalized === 'string') {
+    return normalized;
+  }
+
+  if (!toolNames.has(normalized.function.name)) {
+    throw new BadRequestError(`Unknown tool "${normalized.function.name}" requested in tool_choice.`);
+  }
+
+  return {
+    type: 'function',
+    function: {
+      name: normalized.function.name
+    }
+  };
+}
+
+function validateIgnoredChatFields(payload, tools, toolChoice) {
   if (payload.n !== undefined && payload.n !== 1) {
     throw new BadRequestError('Only n=1 is supported for chat completions.');
   }
 
-  if (Array.isArray(payload.tools) && payload.tools.length > 0) {
-    throw new BadRequestError('Tool calling is not supported yet.');
-  }
-
-  if (Array.isArray(payload.functions) && payload.functions.length > 0) {
-    throw new BadRequestError('Function calling is not supported yet.');
+  if (!tools.length && toolChoice === 'required') {
+    throw new BadRequestError('tool_choice="required" requires at least one declared tool.');
   }
 
   if (Array.isArray(payload.modalities) && payload.modalities.some((item) => item !== 'text')) {

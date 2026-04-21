@@ -5,6 +5,7 @@ A local Node.js server that exposes an OpenAI-compatible API on top of `https://
 ## Features
 
 - OpenAI-compatible `POST /v1/chat/completions` with regular and streaming SSE responses
+- OpenAI-compatible function calling emulation with `tools`, `tool_choice`, and `role: tool`
 - Password-first auto login with browser fallback
 - Persistent local DeepSeek session reuse
 - Built-in PoW challenge solving for `chat.deepseek.com`
@@ -111,6 +112,35 @@ curl http://127.0.0.1:8787/v1/chat/completions \
   }'
 ```
 
+Function calling:
+
+```bash
+curl http://127.0.0.1:8787/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{
+    "model": "deepseek-web-chat",
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "description": "Get the current weather for a city",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "city": { "type": "string" }
+            },
+            "required": ["city"]
+          }
+        }
+      }
+    ],
+    "messages": [
+      {"role":"user","content":"What is the weather in Brussels right now?"}
+    ]
+  }'
+```
+
 ## Using with OpenAI-Compatible Clients
 
 You can add an API key to your local proxy and then use it with any app/plugin that supports custom OpenAI endpoints (like UI dashboards, IDE extensions, CLI tools).
@@ -127,7 +157,7 @@ Now configure your external application using these settings:
 - **API Key / Bearer Token**: `sk-my-secret-key` (or whatever you set above)
 - **Model**: `deepseek-web-chat` or `deepseek-web-think`
 
-For compatibility with clients like Continue, the server also accepts and ignores several common OpenAI chat fields when they are harmless, such as `top_p`, `presence_penalty`, `frequency_penalty`, `stop`, `stream_options`, and `max_completion_tokens`. Non-empty tool/function calling payloads and non-text modalities are still rejected.
+For compatibility with clients like Continue, the server also accepts several common OpenAI chat fields when they are harmless, such as `top_p`, `presence_penalty`, `frequency_penalty`, `stop`, `stream_options`, and `max_completion_tokens`. It also supports OpenAI-style function calling payloads with `tools`, `tool_choice`, assistant `tool_calls`, and follow-up `role: tool` messages.
 
 ## Helper Scripts
 
@@ -245,6 +275,15 @@ curl -X POST http://127.0.0.1:8787/debug/cleanup-sessions \
 ```
 
 `scope: "all"` deletes chat sessions visible on the account, while `scope: "tracked"` only retries locally tracked orphan sessions created by this API.
+
+## Function Calling Notes
+
+- Function calling is emulated locally on top of DeepSeek Web, it is not native DeepSeek tool calling
+- The adapter forces a JSON-only intermediate format, validates it locally, and converts it back into OpenAI-style `tool_calls`
+- Regular non-stream responses are supported
+- Streaming tool calls are supported through a synthetic OpenAI-compatible SSE stream
+- Non-empty tool/function declarations are supported, but only for function tools
+- `n > 1`, audio output, and non-text modalities are still unsupported
 
 ## Project Notes
 

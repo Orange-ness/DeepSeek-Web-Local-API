@@ -37,8 +37,25 @@ test('parseChatCompletionRequest accepts common OpenAI-compatible extra fields',
     stop: ['</final>'],
     user: 'continue-user',
     stream_options: { include_usage: true },
-    tools: [],
-    functions: [],
+    tools: [
+      {
+        type: 'function',
+        function: {
+          name: 'get_weather',
+          description: 'Get the current weather',
+          parameters: {
+            type: 'object',
+            properties: {
+              city: { type: 'string' }
+            }
+          }
+        }
+      }
+    ],
+    tool_choice: {
+      type: 'function',
+      function: { name: 'get_weather' }
+    },
     messages: [
       { role: 'developer', content: 'You are a careful coding assistant.' },
       { role: 'user', content: 'Hello' }
@@ -48,6 +65,11 @@ test('parseChatCompletionRequest accepts common OpenAI-compatible extra fields',
   assert.equal(parsed.max_tokens, 256);
   assert.equal(parsed.messages[0].role, 'system');
   assert.equal(parsed.messages[0].content, 'You are a careful coding assistant.');
+  assert.equal(parsed.tools[0].function.name, 'get_weather');
+  assert.deepEqual(parsed.tool_choice, {
+    type: 'function',
+    function: { name: 'get_weather' }
+  });
 });
 
 test('parseChatCompletionRequest rejects unsupported message content', () => {
@@ -64,7 +86,47 @@ test('parseChatCompletionRequest rejects unsupported message content', () => {
   });
 });
 
-test('parseChatCompletionRequest rejects unsupported tool calls and n>1', () => {
+test('parseChatCompletionRequest accepts tool call history messages', () => {
+  const parsed = parseChatCompletionRequest({
+    model: 'deepseek-web-chat',
+    tools: [
+      {
+        type: 'function',
+        function: {
+          name: 'get_weather'
+        }
+      }
+    ],
+    messages: [
+      { role: 'user', content: 'Weather?' },
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [
+          {
+            id: 'call_123',
+            type: 'function',
+            function: {
+              name: 'get_weather',
+              arguments: '{"city":"Brussels"}'
+            }
+          }
+        ]
+      },
+      {
+        role: 'tool',
+        tool_call_id: 'call_123',
+        content: '{"temperature_c":20}'
+      }
+    ]
+  });
+
+  assert.equal(parsed.messages[1].tool_calls[0].function.name, 'get_weather');
+  assert.equal(parsed.messages[2].role, 'tool');
+  assert.equal(parsed.messages[2].tool_call_id, 'call_123');
+});
+
+test('parseChatCompletionRequest rejects invalid n and unknown forced tools', () => {
   assert.throws(() => {
     parseChatCompletionRequest({
       model: 'deepseek-web-chat',
@@ -77,6 +139,10 @@ test('parseChatCompletionRequest rejects unsupported tool calls and n>1', () => 
     parseChatCompletionRequest({
       model: 'deepseek-web-chat',
       tools: [{ type: 'function', function: { name: 'x' } }],
+      tool_choice: {
+        type: 'function',
+        function: { name: 'missing' }
+      },
       messages: [{ role: 'user', content: 'Hello' }]
     });
   });

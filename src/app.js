@@ -87,6 +87,15 @@ export function buildApp({
     reply.raw.flushHeaders?.();
 
     try {
+      if (Array.isArray(handle.sseFrames)) {
+        for (const frame of handle.sseFrames) {
+          reply.raw.write(toSseFrame(frame));
+        }
+        reply.raw.write(toSseFrame('[DONE]'));
+        reply.raw.end();
+        return reply;
+      }
+
       reply.raw.write(toSseFrame(service.initialChunk(handle)));
       if (handle.firstDelta) {
         reply.raw.write(toSseFrame(service.contentChunk({ ...handle, delta: handle.firstDelta })));

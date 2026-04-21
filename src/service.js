@@ -1,6 +1,12 @@
 import { AsyncSemaphore } from './queue.js';
 import { AuthenticationRequiredError, UpstreamError } from './errors.js';
 import {
+  buildFunctionCallingPrompt,
+  createFunctionCallingParseError,
+  isFunctionCallingRequest,
+  parseFunctionCallingResponse
+} from './function-calling.js';
+import {
   flattenMessagesToPrompt,
   parseCleanupSessions,
   parseAutoLogin,
@@ -9,7 +15,12 @@ import {
   resolveModel,
   PUBLIC_MODELS
 } from './models.js';
-import { createChatCompletionChunk, createChatCompletionId, createChatCompletionResponse } from './openai.js';
+import {
+  createChatCompletionChunk,
+  createChatCompletionId,
+  createChatCompletionResponse,
+  createSyntheticChatCompletionFrames
+} from './openai.js';
 import { MetricsStore } from './metrics.js';
 
 export class DeepSeekApiService {
@@ -202,28 +213,7 @@ export class DeepSeekApiService {
 
   async createCompletion(payload, { signal } = {}) {
     const { request, model } = this.parseChatRequest(payload);
-    const prompt = flattenMessagesToPrompt(request.messages, {
-      responseFormat: request.response_format
-    });
-    const id = createChatCompletionId();
-
-    const result = await this.runChatOperation({
-      request,
-      model,
-      signal,
-      stream: false,
-      execute: ({ session }) =>
-        this.client.completeChat({
-          session,
-          prompt,
-          thinkingEnabled: model.thinkingEnabled,
-          temperature: request.temperature,
-          maxTokens: request.max_tokens,
-          metadata: request.metadata,
-          responseFormat: request.response_format,
-          signal
-        })
-    });
+    const result = await this.executeCompletionFromParsed({ request, model, signal });
 
     this.metrics.recordChatRequest({
       model: model.publicModel,
@@ -231,25 +221,37 @@ export class DeepSeekApiService {
       traceId: result.traceId
     });
 
-    const response = createChatCompletionResponse({
-      id,
-      model: model.publicModel,
-      content: result.content
-    });
-
-    if (request.debug_upstream) {
-      response._debug = {
-        upstream_trace_id: result.traceId,
-        attempts: result.attempts,
-        refreshed_session: result.refreshedSession
-      };
-    }
-
-    return response;
+    return attachDebugMetadata(result.response, request, result);
   }
 
   async startStreamingCompletion(payload, { signal } = {}) {
     const { request, model } = this.parseChatRequest(payload);
+
+    if (isFunctionCallingRequest(request)) {
+      const result = await this.executeCompletionFromParsed({ request, model, signal });
+      this.metrics.recordChatRequest({
+        model: model.publicModel,
+        stream: true,
+        traceId: result.traceId
+      });
+
+      return {
+        id: result.response.id,
+        model: result.response.model,
+        release: () => {},
+        traceId: result.traceId,
+        attempts: result.attempts,
+        refreshedSession: result.refreshedSession,
+        debugUpstream: request.debug_upstream,
+        sseFrames: createSyntheticChatCompletionFrames({
+          id: result.response.id,
+          model: result.response.model,
+          content: result.response.choices[0]?.message?.content || '',
+          toolCalls: result.response.choices[0]?.message?.tool_calls || []
+        })
+      };
+    }
+
     const prompt = flattenMessagesToPrompt(request.messages, {
       responseFormat: request.response_format
     });
@@ -303,6 +305,126 @@ export class DeepSeekApiService {
       release();
       throw error;
     }
+  }
+
+  async executeCompletionFromParsed({ request, model, signal }) {
+    const id = createChatCompletionId();
+
+    if (isFunctionCallingRequest(request)) {
+      return this.executeFunctionCallingCompletion({
+        id,
+        request,
+        model,
+        signal
+      });
+    }
+
+    const result = await this.executeUpstreamTextCompletion({
+      request,
+      model,
+      signal
+    });
+
+    return {
+      ...result,
+      response: createChatCompletionResponse({
+        id,
+        model: model.publicModel,
+        content: result.content
+      })
+    };
+  }
+
+  async executeFunctionCallingCompletion({ id, request, model, signal }) {
+    let repairInstruction = '';
+    let totalAttempts = 0;
+    let refreshedSession = false;
+    let traceId = null;
+
+    for (let structuredAttempt = 1; structuredAttempt <= 2; structuredAttempt += 1) {
+      const upstream = await this.executeUpstreamTextCompletion({
+        request,
+        model,
+        signal,
+        prompt: buildFunctionCallingPrompt({
+          messages: request.messages,
+          tools: request.tools,
+          toolChoice: request.tool_choice,
+          parallelToolCalls: request.parallel_tool_calls !== false,
+          repairInstruction
+        }),
+        responseFormat: { type: 'json_object' }
+      });
+
+      totalAttempts += upstream.attempts;
+      refreshedSession = refreshedSession || upstream.refreshedSession;
+      traceId = upstream.traceId;
+
+      try {
+        const parsed = parseFunctionCallingResponse(upstream.content, {
+          tools: request.tools,
+          toolChoice: request.tool_choice,
+          parallelToolCalls: request.parallel_tool_calls !== false
+        });
+
+        return {
+          traceId,
+          attempts: totalAttempts,
+          refreshedSession,
+          structuredAttempts: structuredAttempt,
+          response: createChatCompletionResponse({
+            id,
+            model: model.publicModel,
+            ...(parsed.type === 'tool_calls'
+              ? { toolCalls: parsed.tool_calls }
+              : { content: parsed.content })
+          })
+        };
+      } catch (error) {
+        if (structuredAttempt === 2) {
+          throw createFunctionCallingParseError(error, upstream.content);
+        }
+
+        repairInstruction = error.message || String(error);
+      }
+    }
+
+    throw new UpstreamError('Function calling emulation could not produce a valid response.', {
+      statusCode: 502,
+      code: 'upstream_invalid_tool_call'
+    });
+  }
+
+  async executeUpstreamTextCompletion({
+    request,
+    model,
+    signal,
+    prompt,
+    responseFormat
+  }) {
+    const finalPrompt =
+      prompt ||
+      flattenMessagesToPrompt(request.messages, {
+        responseFormat: responseFormat || request.response_format
+      });
+
+    return this.runChatOperation({
+      request,
+      model,
+      signal,
+      stream: false,
+      execute: ({ session }) =>
+        this.client.completeChat({
+          session,
+          prompt: finalPrompt,
+          thinkingEnabled: model.thinkingEnabled,
+          temperature: request.temperature,
+          maxTokens: request.max_tokens,
+          metadata: request.metadata,
+          responseFormat: responseFormat || request.response_format,
+          signal
+        })
+    });
   }
 
   initialChunk({ id, model }) {
@@ -409,6 +531,20 @@ export class DeepSeekApiService {
       throw error;
     }
   }
+}
+
+function attachDebugMetadata(response, request, result) {
+  if (!request.debug_upstream) {
+    return response;
+  }
+
+  response._debug = {
+    upstream_trace_id: result.traceId,
+    attempts: result.attempts,
+    refreshed_session: result.refreshedSession,
+    ...(result.structuredAttempts ? { structured_attempts: result.structuredAttempts } : {})
+  };
+  return response;
 }
 
 function shouldRefreshSession(error) {

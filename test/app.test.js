@@ -120,6 +120,142 @@ test('chat completion maps upstream 5xx to bad gateway', async () => {
   await app.close();
 });
 
+test('non-stream function calling returns OpenAI-style tool_calls', async () => {
+  const app = buildTestApp();
+
+  await app.ready();
+  const response = await app.inject({
+    method: 'POST',
+    url: '/v1/chat/completions',
+    payload: {
+      model: 'deepseek-web-chat',
+      tools: [
+        {
+          type: 'function',
+          function: {
+            name: 'get_weather',
+            description: 'Get the current weather',
+            parameters: {
+              type: 'object',
+              properties: {
+                city: { type: 'string' }
+              }
+            }
+          }
+        }
+      ],
+      messages: [{ role: 'user', content: 'What is the weather in Brussels?' }]
+    }
+  });
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.json().choices[0].finish_reason, 'tool_calls');
+  assert.equal(response.json().choices[0].message.content, null);
+  assert.equal(response.json().choices[0].message.tool_calls[0].function.name, 'get_weather');
+  assert.equal(
+    response.json().choices[0].message.tool_calls[0].function.arguments,
+    '{"city":"Brussels"}'
+  );
+
+  await app.close();
+});
+
+test('streaming function calling emits tool_calls chunks', async () => {
+  const app = buildTestApp();
+
+  await app.ready();
+  const response = await app.inject({
+    method: 'POST',
+    url: '/v1/chat/completions',
+    payload: {
+      model: 'deepseek-web-chat',
+      stream: true,
+      tools: [
+        {
+          type: 'function',
+          function: {
+            name: 'get_weather',
+            parameters: {
+              type: 'object',
+              properties: {
+                city: { type: 'string' }
+              }
+            }
+          }
+        }
+      ],
+      messages: [{ role: 'user', content: 'What is the weather in Brussels?' }]
+    }
+  });
+
+  assert.equal(response.statusCode, 200);
+  assert.match(response.body, /"tool_calls"/);
+  assert.match(response.body, /"name":"get_weather"/);
+  assert.match(response.body, /"finish_reason":"tool_calls"/);
+  assert.match(response.body, /\[DONE\]/);
+
+  await app.close();
+});
+
+test('function calling follow-up can turn tool results into a final answer', async () => {
+  const app = buildTestApp();
+
+  await app.ready();
+  const response = await app.inject({
+    method: 'POST',
+    url: '/v1/chat/completions',
+    payload: {
+      model: 'deepseek-web-chat',
+      tools: [
+        {
+          type: 'function',
+          function: {
+            name: 'get_weather',
+            parameters: {
+              type: 'object',
+              properties: {
+                city: { type: 'string' }
+              }
+            }
+          }
+        }
+      ],
+      messages: [
+        { role: 'user', content: 'What is the weather in Brussels?' },
+        {
+          role: 'assistant',
+          content: null,
+          tool_calls: [
+            {
+              id: 'call_weather',
+              type: 'function',
+              function: {
+                name: 'get_weather',
+                arguments: '{"city":"Brussels"}'
+              }
+            }
+          ]
+        },
+        {
+          role: 'tool',
+          tool_call_id: 'call_weather',
+          content: '{"temperature_c":20,"condition":"sunny"}'
+        },
+        {
+          role: 'user',
+          content: 'Now answer for the user in one sentence.'
+        }
+      ]
+    }
+  });
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.json().choices[0].finish_reason, 'stop');
+  assert.match(response.json().choices[0].message.content, /Brussels/i);
+
+  await app.close();
+});
+
 test('auth debug and metrics expose the new diagnostics', async () => {
   const app = buildTestApp();
 
@@ -403,6 +539,7 @@ function createFakeFetch({ baseUrl, errorStatus, requestLog, remoteSessions }) {
     const url = typeof input === 'string' ? input : input.toString();
     const method = init.method || 'GET';
     const body = typeof init.body === 'string' ? init.body : null;
+    const parsedBody = body ? safeJsonParse(body) : null;
 
     requestLog.push({ url, method, body });
 
@@ -489,6 +626,31 @@ function createFakeFetch({ baseUrl, errorStatus, requestLog, remoteSessions }) {
         });
       }
 
+      if (parsedBody?.prompt?.includes('OpenAI-compatible function calling adapter')) {
+        const toolResponse = parsedBody.prompt.includes('[tool_result')
+          ? '{"type":"message","content":"The weather in Brussels is 20C and sunny."}'
+          : '{"type":"tool_calls","tool_calls":[{"name":"get_weather","arguments":{"city":"Brussels"}}]}';
+        const halfway = Math.max(1, Math.floor(toolResponse.length / 2));
+        const body = new ReadableStream({
+          start(controller) {
+            controller.enqueue(encoder.encode('event: ready\ndata: {"request_message_id":1,"response_message_id":2}\n\n'));
+            controller.enqueue(
+              encoder.encode(`data: ${JSON.stringify({ content: toolResponse.slice(0, halfway) })}\n\n`)
+            );
+            controller.enqueue(
+              encoder.encode(`data: ${JSON.stringify({ content: toolResponse })}\n\n`)
+            );
+            controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+            controller.close();
+          }
+        });
+
+        return new Response(body, {
+          status: 200,
+          headers: { 'content-type': 'text/event-stream; charset=utf-8' }
+        });
+      }
+
       const body = new ReadableStream({
         start(controller) {
           controller.enqueue(encoder.encode('event: ready\ndata: {"request_message_id":1,"response_message_id":2}\n\n'));
@@ -512,6 +674,14 @@ function createFakeFetch({ baseUrl, errorStatus, requestLog, remoteSessions }) {
 }
 
 const encoder = new TextEncoder();
+
+function safeJsonParse(value) {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
 
 async function waitFor(predicate, { timeoutMs = 1000, intervalMs = 10 } = {}) {
   const deadline = Date.now() + timeoutMs;
