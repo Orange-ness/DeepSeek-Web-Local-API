@@ -82,7 +82,22 @@ try {
     const modelIds = new Set((response.data || []).map((model) => model.id));
     assert(modelIds.has('deepseek-web-chat'), 'models should include deepseek-web-chat');
     assert(modelIds.has('deepseek-web-think'), 'models should include deepseek-web-think');
+    assert(modelIds.has('deepseek-web-expert'), 'models should include deepseek-web-expert');
+    assert(modelIds.has('deepseek-web-vision'), 'models should include deepseek-web-vision');
     return { models: [...modelIds] };
+  });
+
+  await runStep('GET /v1/capabilities', async () => {
+    const response = await requestJson('GET', '/v1/capabilities');
+    const modeIds = new Set((response.reasoning_modes || []).map((mode) => mode.id));
+    assert(modeIds.has('Instant'), 'capabilities should include Instant mode');
+    assert(modeIds.has('Expert'), 'capabilities should include Expert mode');
+    assert(modeIds.has('Vision'), 'capabilities should include Vision mode');
+    assert(response.generation_parameters?.top_p?.maximum === 1, 'top_p range should be exposed');
+    return {
+      modes: [...modeIds],
+      tool_calling: response.compatibility?.tool_calling
+    };
   });
 
   const debugCompletion = await runStep('POST /v1/chat/completions non-stream alias', async () => {
@@ -149,6 +164,28 @@ try {
     return { preview: preview(content) };
   });
 
+  await runStep('POST /v1/chat/completions advanced controls', async () => {
+    const { json } = await requestCompletion({
+      model: 'deepseek-web-chat',
+      reasoning_mode: 'Expert',
+      stream: false,
+      temperature: 0.2,
+      top_p: 0.9,
+      max_tokens: 512,
+      context_size: 2,
+      system_prompt: 'Reply as a terse code reviewer.',
+      messages: [
+        { role: 'user', content: 'Old request.' },
+        { role: 'assistant', content: 'Old response.' },
+        { role: 'user', content: 'Say OK if advanced controls work.' }
+      ]
+    });
+
+    const content = json?.choices?.[0]?.message?.content || '';
+    assert(content.trim().length > 0, 'advanced controls completion content should not be empty');
+    return { preview: preview(content) };
+  });
+
   await runStep('POST /v1/chat/completions json_object response_format', async () => {
     const { json } = await requestCompletion({
       model: 'deepseek-web-chat',
@@ -172,7 +209,7 @@ try {
         messages: [
           {
             role: 'user',
-            content: [{ type: 'image_url', image_url: { url: 'https://example.com/image.png' } }]
+            content: [{ type: 'audio_url', audio_url: { url: 'https://example.com/audio.wav' } }]
           }
         ]
       })

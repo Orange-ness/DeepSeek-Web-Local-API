@@ -6,6 +6,9 @@ A local Node.js server that exposes an OpenAI-compatible API on top of `https://
 
 - OpenAI-compatible `POST /v1/chat/completions` with regular and streaming SSE responses
 - OpenAI-compatible function calling emulation with `tools`, `tool_choice`, and `role: tool`
+- Advanced local controls: `reasoning_mode`, `temperature`, `top_p`, `max_tokens`, `context_size`, and `system_prompt`
+- File attachment support for parseable DeepSeek Web files, including OCR-friendly images
+- Lightweight local admin dashboard at `GET /admin`
 - Password-first auto login with browser fallback
 - Persistent local DeepSeek session reuse
 - Built-in PoW challenge solving for `chat.deepseek.com`
@@ -78,10 +81,13 @@ Passwords are never written to disk.
 - `POST /auth/login/auto`
 - `POST /auth/logout`
 - `POST /debug/cleanup-sessions`
+- `GET /debug/upstream`
 - `GET /debug/upstream/latest`
 - `GET /debug/upstream/:id`
 - `GET /v1/models`
+- `GET /v1/capabilities`
 - `POST /v1/chat/completions`
+- `GET /admin`
 
 ## OpenAI-Compatible Example
 
@@ -112,6 +118,37 @@ curl http://127.0.0.1:8787/v1/chat/completions \
   }'
 ```
 
+Advanced controls:
+
+```bash
+curl http://127.0.0.1:8787/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{
+    "model": "deepseek-web-chat",
+    "reasoning_mode": "Expert",
+    "temperature": 0.2,
+    "top_p": 0.9,
+    "max_tokens": 1024,
+    "context_size": 8,
+    "system_prompt": "You are a careful senior code reviewer.",
+    "messages": [
+      {"role":"user","content":"Review this patch and list the highest-risk issue first."}
+    ]
+  }'
+```
+
+Reasoning modes:
+
+- `Instant`: fast chat path, DeepSeek thinking disabled
+- `Expert`: reasoning path, DeepSeek thinking enabled
+- `Vision`: attachment-aware path for image and file inputs
+
+You can select a mode with `reasoning_mode` / `mode` or by using `deepseek-web-instant`, `deepseek-web-expert`, or `deepseek-web-vision`.
+
+The legacy IDs still work: `deepseek-web-chat`, `deepseek-chat`, `deepseek-web-think`, and `deepseek-reasoner`.
+
+`context_size` keeps the most recent non-system conversation messages while preserving `system` and `developer` instructions. `system_prompt` is prepended as an additional system instruction so clients can set behavior without rewriting the `messages` array.
+
 Function calling:
 
 ```bash
@@ -141,6 +178,90 @@ curl http://127.0.0.1:8787/v1/chat/completions \
   }'
 ```
 
+File attachment with a local text file:
+
+```bash
+curl http://127.0.0.1:8787/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{
+    "model": "deepseek-web-chat",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {"type":"text","text":"What animal is mentioned in the attached file?"},
+          {
+            "type":"input_file",
+            "input_file": {
+              "path": "./notes.txt"
+            }
+          }
+        ]
+      }
+    ]
+  }'
+```
+
+Image attachment with a local path:
+
+```bash
+curl http://127.0.0.1:8787/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{
+    "model": "deepseek-web-chat",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {"type":"text","text":"What text is visible in this image?"},
+          {
+            "type":"image_url",
+            "image_url": {
+              "url": "./scan.png"
+            }
+          }
+        ]
+      }
+    ]
+  }'
+```
+
+Data URL image attachment:
+
+```json
+{
+  "model": "deepseek-web-chat",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        { "type": "text", "text": "Summarize this image." },
+        {
+          "type": "image_url",
+          "image_url": {
+            "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAA..."
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+Supported attachment inputs:
+
+- `image_url.url`: `http(s)://`, `data:`, `file://`, absolute paths, or relative local paths
+- `input_file.path`: local file path
+- `input_file.url`: remote URL or `file://` URL
+- `input_file.data` / `input_file.file_data`: base64 or `data:` URL
+
+Important limitation:
+
+- DeepSeek Web currently treats attachments through its file extraction pipeline.
+- That means text files work well, and images work when DeepSeek can extract usable text or OCR content from them.
+- Pure vision-style image understanding is not guaranteed on the current web flow or current account/model configuration.
+- If DeepSeek ends parsing with statuses like `CONTENT_EMPTY`, the local API returns a clear `400` instead of forwarding an opaque upstream `invalid ref file id`.
+
 ## Using with OpenAI-Compatible Clients
 
 You can add an API key to your local proxy and then use it with any app/plugin that supports custom OpenAI endpoints (like UI dashboards, IDE extensions, CLI tools).
@@ -155,9 +276,92 @@ Now configure your external application using these settings:
 
 - **API Base URL / Endpoint URL**: `http://127.0.0.1:8787/v1`
 - **API Key / Bearer Token**: `sk-my-secret-key` (or whatever you set above)
-- **Model**: `deepseek-web-chat` or `deepseek-web-think`
+- **Model**: `deepseek-web-instant`, `deepseek-web-expert`, `deepseek-web-vision`, `deepseek-web-chat`, or `deepseek-web-think`
 
-For compatibility with clients like Continue, the server also accepts several common OpenAI chat fields when they are harmless, such as `top_p`, `presence_penalty`, `frequency_penalty`, `stop`, `stream_options`, and `max_completion_tokens`. It also supports OpenAI-style function calling payloads with `tools`, `tool_choice`, assistant `tool_calls`, and follow-up `role: tool` messages.
+For compatibility with coding assistants, the server accepts common OpenAI chat fields such as `temperature`, `top_p`, `max_tokens`, `max_completion_tokens`, `presence_penalty`, `frequency_penalty`, `stop`, `stream_options`, and `reasoning_effort`. It also supports OpenAI-style function calling payloads with `tools`, `tool_choice`, assistant `tool_calls`, and follow-up `role: tool` messages.
+
+Capability discovery:
+
+```bash
+curl http://127.0.0.1:8787/v1/capabilities
+```
+
+Admin dashboard:
+
+Open `http://127.0.0.1:8787/admin` while the server is running. If `LOCAL_API_KEY` is set, enter it in the dashboard header; the page itself is public on the local bind address, but API data endpoints still require the bearer token.
+
+### Continue
+
+Official docs: <https://docs.continue.dev/customize/model-providers/top-level/openai>
+
+`config.yaml`:
+
+```yaml
+name: DeepSeek Local
+version: 0.0.1
+schema: v1
+
+models:
+  - name: DeepSeek Expert
+    provider: openai
+    model: deepseek-web-expert
+    apiBase: http://127.0.0.1:8787/v1
+    apiKey: sk-my-secret-key
+    useResponsesApi: false
+    defaultCompletionOptions:
+      temperature: 0.2
+      top_p: 0.9
+      max_tokens: 4096
+      reasoning_mode: Expert
+      context_size: 24
+```
+
+Use `deepseek-web-expert` for code generation, refactors, and review. Use `deepseek-web-instant` for quick edits. Continue can send OpenAI `tools` payloads; this API converts them to local function-calling emulation.
+
+### Cline
+
+Official docs: <https://docs.cline.bot/provider-config/openai-compatible>
+
+In Cline settings:
+
+- API Provider: `OpenAI Compatible`
+- Base URL: `http://127.0.0.1:8787/v1`
+- API Key: `sk-my-secret-key`
+- Model ID: `deepseek-web-expert`
+- Max Output Tokens: `4096`
+- Context Window size: use your preferred local history window, for example `24`
+- Image Support: enable when using `deepseek-web-vision`
+
+Cline agent/tool requests are supported through OpenAI-compatible `tools`, `tool_choice`, and `role: tool` messages. Function calling is emulated locally, so tool schemas should stay explicit and JSON-object based.
+
+CLI setup example:
+
+```bash
+cline auth -p openai -k sk-my-secret-key -m deepseek-web-expert -b http://127.0.0.1:8787/v1
+```
+
+### Zed
+
+Official docs: <https://zed.dev/docs/ai/llm-providers>
+
+You can configure the local DeepSeek proxy directly through the Zed user interface:
+
+1. Click on the three dots menu in the Assistant panel and go to **Settings**.
+2. Under the **LLM Providers** category, click **Add provider** and select **OpenAI**.
+3. Fill in the following configuration:
+   - **Provider name**: `DeepSeek Local` (or any name you prefer)
+   - **API URL**: `http://127.0.0.1:8787/v1`
+   - **API Key**: The `LOCAL_API_KEY` you configured in your `.env` file
+   - **Model name**: Enter the name of the model you want to use (e.g., `deepseek-web-expert`, `deepseek-web-instant`, `deepseek-web-vision`). You can add multiple models.
+   - **Max Completion Tokens**, **Max Output Tokens**, **Max Tokens**: Set these to the maximum possible values (e.g., `4096` for output, `128000` for context).
+4. Configure the model capabilities based on the model you chose. For example, for `deepseek-web-expert`:
+   - **Supports tools**: `True`
+   - **Supports images**: `False`
+   - **Supports parallel_tool_calls**: `True`
+   - **Supports prompt_cache_key**: `False`
+   - **Supports /chat/completions**: `True`
+
+Use `deepseek-web-vision` if you need image support (`Supports images: True`).
 
 ## Helper Scripts
 
@@ -173,10 +377,23 @@ Streaming smoke test:
 npm run smoke -- --stream "Explain what an API is in one sentence"
 ```
 
+Advanced smoke test:
+
+```bash
+npm run smoke -- --mode Expert --temperature 0.2 --max-tokens 512 "Review this function"
+```
+
 JSON-mode smoke test:
 
 ```bash
 npm run smoke -- --json "Return {\"status\":\"ok\"}"
+```
+
+Attachment smoke tests:
+
+```bash
+npm run smoke -- --file ./notes.txt "Summarize the attached file"
+npm run smoke -- --image ./scan.png "What text is in this image?"
 ```
 
 Full verification:
@@ -229,6 +446,11 @@ npm run setup -- --browser-login
 - `LOCAL_API_BASE_URL`: helper script target, default `http://127.0.0.1:8787`
 - `DEEPSEEK_LOCAL_MODEL`: default model for `npm run smoke`
 - `DEEPSEEK_LOCAL_SYSTEM`: default system prompt for `npm run smoke`
+- `DEEPSEEK_LOCAL_REASONING_MODE`: default `reasoning_mode` for `npm run smoke`
+- `DEEPSEEK_LOCAL_TEMPERATURE`: default `temperature` for `npm run smoke`
+- `DEEPSEEK_LOCAL_TOP_P`: default `top_p` for `npm run smoke`
+- `DEEPSEEK_LOCAL_MAX_TOKENS`: default `max_tokens` for `npm run smoke`
+- `DEEPSEEK_LOCAL_CONTEXT_SIZE`: default `context_size` for `npm run smoke`
 - `DEEPSEEK_TEST_MESSAGE`: default message for `npm run smoke`
 - `UPSTREAM_CONCURRENCY`: maximum concurrent upstream requests
 - `CHAT_MAX_ATTEMPTS`: max retries for chat requests after refresh or rate limiting
@@ -246,6 +468,7 @@ See [.env.example](./.env.example) for a ready-to-copy template.
 ## Debugging and Observability
 
 - `GET /metrics` returns local request, auth, chat, queue, and trace counters
+- `GET /v1/capabilities` returns supported modes, tunable parameters, endpoints, and IDE-facing features
 - `GET /auth/debug` returns a sanitized view of the stored session and captured transport
 - `POST /debug/cleanup-sessions` manually deletes chat sessions from the DeepSeek account
 - `GET /debug/upstream/latest` returns the latest captured upstream trace
@@ -287,7 +510,7 @@ curl -X POST http://127.0.0.1:8787/debug/cleanup-sessions \
 
 ## Project Notes
 
-- This project is text-only for now
+- Vision mode uses DeepSeek Web attachments and file extraction; pure image understanding depends on the upstream account and web behavior
 - DeepSeek web endpoints may change over time
 - The server stores session artifacts locally, but never persists your password
 - Password-only login is more robust now, but DeepSeek anti-bot checks or social-login-only accounts can still force a visible browser fallback

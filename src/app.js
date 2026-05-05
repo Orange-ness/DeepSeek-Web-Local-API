@@ -7,6 +7,7 @@ import { DeepSeekWebClient } from './deepseek/client.js';
 import { DeepSeekSessionManager } from './deepseek/session-manager.js';
 import { DeepSeekApiService } from './service.js';
 import { MetricsStore } from './metrics.js';
+import { renderAdminDashboard } from './admin-dashboard.js';
 
 export function buildApp({
   config = resolveConfig(),
@@ -30,6 +31,10 @@ export function buildApp({
   app.addHook('onRequest', async (request) => {
     request.metricsStartedAt = Date.now();
     service.metrics.beginHttpRequest();
+
+    if (isPublicDashboardRequest(request)) {
+      return;
+    }
 
     if (!config.localApiKey) {
       return;
@@ -61,8 +66,16 @@ export function buildApp({
   app.post('/auth/logout', async () => service.logout());
   app.post('/debug/cleanup-sessions', async (request) => service.cleanupSessions(request.body || {}));
   app.get('/debug/upstream/latest', async () => service.getLatestUpstreamTrace());
+  app.get('/debug/upstream', async () => service.getAllUpstreamTraces());
   app.get('/debug/upstream/:id', async (request) => service.getUpstreamTraceById(request.params.id));
   app.get('/v1/models', async () => service.listModels());
+  app.get('/v1/capabilities', async () => service.getCapabilities());
+  app.get('/admin', async (_request, reply) =>
+    reply.type('text/html; charset=utf-8').send(renderAdminDashboard())
+  );
+  app.get('/admin/', async (_request, reply) =>
+    reply.type('text/html; charset=utf-8').send(renderAdminDashboard())
+  );
 
   app.post('/v1/chat/completions', async (request, reply) => {
     const signal = createAbortSignal(request);
@@ -155,4 +168,9 @@ function createAbortSignal(request) {
   });
 
   return controller.signal;
+}
+
+function isPublicDashboardRequest(request) {
+  const path = request.url.split('?')[0];
+  return request.method === 'GET' && (path === '/admin' || path === '/admin/');
 }

@@ -11,6 +11,13 @@ let debugUpstream = false;
 let jsonMode = false;
 let model = process.env.DEEPSEEK_LOCAL_MODEL || 'deepseek-web-chat';
 let system = process.env.DEEPSEEK_LOCAL_SYSTEM || '';
+let reasoningMode = process.env.DEEPSEEK_LOCAL_REASONING_MODE || '';
+let temperature = process.env.DEEPSEEK_LOCAL_TEMPERATURE || '';
+let topP = process.env.DEEPSEEK_LOCAL_TOP_P || '';
+let maxTokens = process.env.DEEPSEEK_LOCAL_MAX_TOKENS || '';
+let contextSize = process.env.DEEPSEEK_LOCAL_CONTEXT_SIZE || '';
+const inputFiles = [];
+const inputImages = [];
 const messageParts = [];
 
 for (let index = 0; index < args.length; index += 1) {
@@ -43,6 +50,54 @@ for (let index = 0; index < args.length; index += 1) {
     continue;
   }
 
+  if (arg === '--mode') {
+    reasoningMode = args[index + 1] || reasoningMode;
+    index += 1;
+    continue;
+  }
+
+  if (arg === '--temperature') {
+    temperature = args[index + 1] || temperature;
+    index += 1;
+    continue;
+  }
+
+  if (arg === '--top-p') {
+    topP = args[index + 1] || topP;
+    index += 1;
+    continue;
+  }
+
+  if (arg === '--max-tokens') {
+    maxTokens = args[index + 1] || maxTokens;
+    index += 1;
+    continue;
+  }
+
+  if (arg === '--context-size') {
+    contextSize = args[index + 1] || contextSize;
+    index += 1;
+    continue;
+  }
+
+  if (arg === '--file') {
+    const value = args[index + 1];
+    if (value) {
+      inputFiles.push(value);
+      index += 1;
+    }
+    continue;
+  }
+
+  if (arg === '--image') {
+    const value = args[index + 1];
+    if (value) {
+      inputImages.push(value);
+      index += 1;
+    }
+    continue;
+  }
+
   if (arg === '--help' || arg === '-h') {
     printHelp();
     process.exit(0);
@@ -62,12 +117,40 @@ const messages = [];
 if (system) {
   messages.push({ role: 'system', content: system });
 }
-messages.push({ role: 'user', content: message });
+const userContentParts = [{ type: 'text', text: message }];
+
+for (const imagePath of inputImages) {
+  userContentParts.push({
+    type: 'image_url',
+    image_url: {
+      url: imagePath
+    }
+  });
+}
+
+for (const filePath of inputFiles) {
+  userContentParts.push({
+    type: 'input_file',
+    input_file: {
+      path: filePath
+    }
+  });
+}
+
+messages.push({
+  role: 'user',
+  content: userContentParts.length === 1 ? message : userContentParts
+});
 
 const payload = {
   model,
   stream,
   debug_upstream: debugUpstream,
+  ...(reasoningMode ? { reasoning_mode: reasoningMode } : {}),
+  ...(numberOrNull(temperature) !== null ? { temperature: numberOrNull(temperature) } : {}),
+  ...(numberOrNull(topP) !== null ? { top_p: numberOrNull(topP) } : {}),
+  ...(numberOrNull(maxTokens) !== null ? { max_tokens: numberOrNull(maxTokens) } : {}),
+  ...(numberOrNull(contextSize) !== null ? { context_size: numberOrNull(contextSize) } : {}),
   ...(jsonMode ? { response_format: { type: 'json_object' } } : {}),
   messages
 };
@@ -243,12 +326,15 @@ function handleSseBlock(block) {
 function printHelp() {
   console.log(`
 Usage:
-  npm run smoke -- [--stream] [--json] [--debug-upstream] [--model MODEL] [--system PROMPT] "Your message"
+  npm run smoke -- [--stream] [--json] [--debug-upstream] [--model MODEL] [--mode Instant|Expert|Vision] [--system PROMPT] [--temperature N] [--top-p N] [--max-tokens N] [--context-size N] [--image PATH] [--file PATH] "Your message"
 
 Examples:
   npm run smoke -- "Say hello"
   npm run smoke -- --stream --model deepseek-web-think "Explain SSE in one sentence"
+  npm run smoke -- --mode Expert --temperature 0.2 --max-tokens 512 "Review this function"
   npm run smoke -- --json "Return { \\"status\\": \\"ok\\" }"
+  npm run smoke -- --image ./scan.png "What text is in this image?"
+  npm run smoke -- --file ./notes.txt "Summarize the attached file"
 
 Environment variables:
   LOCAL_API_BASE_URL   Default: http://127.0.0.1:8787
@@ -257,9 +343,23 @@ Environment variables:
   DEEPSEEK_PASSWORD    Optional password-first login password
   DEEPSEEK_LOCAL_MODEL Default: deepseek-web-chat
   DEEPSEEK_LOCAL_SYSTEM Optional system prompt
+  DEEPSEEK_LOCAL_REASONING_MODE Optional Instant, Expert, or Vision
+  DEEPSEEK_LOCAL_TEMPERATURE Optional temperature
+  DEEPSEEK_LOCAL_TOP_P Optional top_p
+  DEEPSEEK_LOCAL_MAX_TOKENS Optional max_tokens
+  DEEPSEEK_LOCAL_CONTEXT_SIZE Optional context_size
   DEEPSEEK_TEST_MESSAGE Default message when no argument is provided
 
 Behavior:
   The script checks /auth/status and automatically calls POST /auth/login/auto when the current session is not usable.
 `.trim());
+}
+
+function numberOrNull(value) {
+  if (value === '' || value === undefined || value === null) {
+    return null;
+  }
+
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
 }

@@ -1,14 +1,7 @@
 import { UpstreamError } from './errors.js';
 
 export function isFunctionCallingRequest(request) {
-  return (
-    (Array.isArray(request.tools) && request.tools.length > 0) ||
-    request.messages.some(
-      (message) =>
-        message.role === 'tool' ||
-        (message.role === 'assistant' && Array.isArray(message.tool_calls) && message.tool_calls.length > 0)
-    )
-  );
+  return Array.isArray(request.tools) && request.tools.length > 0;
 }
 
 export function buildFunctionCallingPrompt({
@@ -25,37 +18,47 @@ export function buildFunctionCallingPrompt({
   }));
 
   const rules = [
-    'You are operating inside an OpenAI-compatible function calling adapter.',
-    'Respond with exactly one valid JSON object and no markdown or extra text.',
-    'Allowed response format 1: {"type":"message","content":"plain text answer"}',
-    'Allowed response format 2: {"type":"tool_calls","tool_calls":[{"name":"tool_name","arguments":{...}}]}',
-    'When returning "tool_calls", omit the "content" field or set it to an empty string.',
-    'The "arguments" field must be a JSON object, not a string.',
-    'Never invent tool names that are not listed in AVAILABLE_TOOLS.'
+    'CRITICAL INSTRUCTION: You are a function-calling JSON adapter.',
+    'Your ENTIRE response must be a single raw JSON object. No markdown, no explanation, no extra text.',
+    'Do NOT wrap JSON in ```json``` code fences. Do NOT add any text before or after the JSON.',
+    'Do NOT include any reasoning, thinking, or explanation. ONLY output the JSON object.',
+    '',
+    'Response format A (text answer):',
+    '{"type":"message","content":"[Write your actual response text to the user here]"}',
+    '',
+    'Response format B (tool call):',
+    '{"type":"tool_calls","tool_calls":[{"name":"tool_name","arguments":{...}}]}',
+    '',
+    'Rules:',
+    '- The "arguments" field MUST be a JSON object, not a string.',
+    '- Never invent tool names not in AVAILABLE_TOOLS.',
+    '- When returning tool_calls, omit "content" or set it to "".'
   ];
 
   if (!parallelToolCalls) {
-    rules.push('Return at most one tool call.');
+    rules.push('- Return at most one tool call.');
   }
 
   if (toolChoice === 'none' || availableTools.length === 0) {
-    rules.push('No new tool call is allowed right now. You must return {"type":"message",...}.');
+    rules.push('- No tool calls allowed. You MUST return {"type":"message","content":"..."}.');
   } else if (toolChoice === 'required') {
-    rules.push('You must return at least one tool call.');
+    rules.push('- You MUST return at least one tool call. Do NOT return a message.');
   } else if (typeof toolChoice === 'object' && toolChoice?.function?.name) {
-    rules.push(`You must return exactly one tool call named "${toolChoice.function.name}".`);
+    rules.push(`- You MUST return exactly one tool call named "${toolChoice.function.name}".`);
   } else {
-    rules.push('If the answer requires external action or structured lookup, return tool_calls. Otherwise return a message.');
+    rules.push('- If external action is needed, return tool_calls. Otherwise return a message.');
   }
 
   if (repairInstruction) {
-    rules.push(`The previous attempt was invalid. Fix it strictly: ${repairInstruction}`);
+    rules.push('');
+    rules.push(`REPAIR: Your previous response was invalid. Error: ${repairInstruction}`);
+    rules.push('Fix the issue and respond with ONLY the corrected JSON object.');
   }
 
   return [
     rules.join('\n'),
     `AVAILABLE_TOOLS:\n${JSON.stringify(availableTools, null, 2)}`,
-    `CONVERSATION:\n${renderConversation(messages)}`
+    `CONVERSATION:\n${renderConversation(messages)}\n\n[assistant]`
   ].join('\n\n');
 }
 
@@ -63,7 +66,7 @@ export function parseFunctionCallingResponse(
   text,
   { tools, toolChoice, parallelToolCalls = true } = {}
 ) {
-  const payload = parseJsonObject(text);
+  const payload = extractJsonObject(text);
   const toolNames = new Set((tools || []).map((tool) => tool.function.name));
 
   if (looksLikeMessagePayload(payload)) {
@@ -225,20 +228,189 @@ function normalizeArgumentsObject(value) {
   return value;
 }
 
-function parseJsonObject(text) {
-  let payload = null;
+/**
+ * Robustly extract a JSON object from the model's response.
+ * Handles: raw JSON, markdown code fences, JSON embedded in prose,
+ * and thinking/reasoning preamble before the actual JSON.
+ */
+function extractJsonObject(text) {
+  if (!text || typeof text !== 'string') {
+    throw new Error('The model returned an empty response.');
+  }
 
+  const trimmed = text.trim();
+
+  // 1. Try direct parse first (ideal case)
+  const directParse = tryParseJson(trimmed);
+  if (directParse !== null && typeof directParse === 'object' && !Array.isArray(directParse)) {
+    return directParse;
+  }
+
+  // 2. Extract from markdown code fences: ```json ... ``` or ``` ... ```
+  const fencePatterns = [
+    /```json\s*\n?([\s\S]*?)```/i,
+    /```\s*\n?([\s\S]*?)```/
+  ];
+
+  for (const pattern of fencePatterns) {
+    const match = trimmed.match(pattern);
+    if (match) {
+      const parsed = tryParseJson(match[1].trim());
+      if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return parsed;
+      }
+    }
+  }
+
+  // 3. Find the outermost balanced { ... } in the text
+  const extracted = extractOutermostBraces(trimmed);
+  if (extracted) {
+    const parsed = tryParseJson(extracted);
+    if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed;
+    }
+  }
+
+  // 4. Try finding the LAST balanced { ... } (sometimes the model outputs
+  //    reasoning first, then the JSON at the end)
+  const lastExtracted = extractLastBraces(trimmed);
+  if (lastExtracted && lastExtracted !== extracted) {
+    const parsed = tryParseJson(lastExtracted);
+    if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed;
+    }
+  }
+
+  // 5. Try aggressive cleanup: strip common prefixes/suffixes
+  const cleaned = trimmed
+    .replace(/^[\s\S]*?(?=\{)/u, '')    // strip everything before first {
+    .replace(/\}[\s\S]*$/u, '}');        // strip everything after last }
+  if (cleaned !== trimmed) {
+    const parsed = tryParseJson(cleaned);
+    if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed;
+    }
+  }
+
+  throw new Error('The model did not return valid JSON. Could not extract a JSON object from the response.');
+}
+
+/**
+ * Extract the first balanced { ... } substring from text.
+ */
+function extractOutermostBraces(text) {
+  const start = text.indexOf('{');
+  if (start === -1) {
+    return null;
+  }
+
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+
+  for (let i = start; i < text.length; i++) {
+    const char = text[i];
+
+    if (escape) {
+      escape = false;
+      continue;
+    }
+
+    if (char === '\\') {
+      escape = true;
+      continue;
+    }
+
+    if (char === '"') {
+      inString = !inString;
+      continue;
+    }
+
+    if (inString) {
+      continue;
+    }
+
+    if (char === '{') {
+      depth++;
+    } else if (char === '}') {
+      depth--;
+      if (depth === 0) {
+        return text.slice(start, i + 1);
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Extract the last balanced { ... } substring from text.
+ * Useful when model outputs reasoning before the JSON.
+ */
+function extractLastBraces(text) {
+  let lastStart = -1;
+  let searchFrom = text.length - 1;
+
+  // Find the last '{' that starts a balanced block
+  while (searchFrom >= 0) {
+    const pos = text.lastIndexOf('{', searchFrom);
+    if (pos === -1) {
+      break;
+    }
+
+    // Try to find matching closing brace
+    let depth = 0;
+    let inString = false;
+    let escape = false;
+    let valid = false;
+
+    for (let i = pos; i < text.length; i++) {
+      const char = text[i];
+
+      if (escape) {
+        escape = false;
+        continue;
+      }
+
+      if (char === '\\') {
+        escape = true;
+        continue;
+      }
+
+      if (char === '"') {
+        inString = !inString;
+        continue;
+      }
+
+      if (inString) {
+        continue;
+      }
+
+      if (char === '{') {
+        depth++;
+      } else if (char === '}') {
+        depth--;
+        if (depth === 0) {
+          lastStart = pos;
+          valid = true;
+          const candidate = text.slice(pos, i + 1);
+          return candidate;
+        }
+      }
+    }
+
+    searchFrom = pos - 1;
+  }
+
+  return null;
+}
+
+function tryParseJson(text) {
   try {
-    payload = JSON.parse(text);
+    return JSON.parse(text);
   } catch {
-    throw new Error('The model did not return valid JSON.');
+    return null;
   }
-
-  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
-    throw new Error('The model returned JSON, but not a JSON object.');
-  }
-
-  return payload;
 }
 
 function safeJsonParse(text) {

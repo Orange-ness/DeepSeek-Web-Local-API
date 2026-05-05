@@ -83,6 +83,10 @@ export class UpstreamTraceStore {
     return clone(this.traces[0] || null);
   }
 
+  getAll() {
+    return clone(this.traces);
+  }
+
   getById(id) {
     return clone(this.traces.find((trace) => trace.id === id) || null);
   }

@@ -58,22 +58,22 @@ test('createDeepSeekDeltaAssembler reads patch-style delta payloads', () => {
   );
 });
 
-test('createDeepSeekDeltaAssembler ignores thinking deltas until response content begins', () => {
+test('createDeepSeekDeltaAssembler preserves thinking deltas and wraps them in <think> tags', () => {
   const assemble = createDeepSeekDeltaAssembler();
 
   assert.equal(
     assemble({ p: 'response/thinking_content', v: 'We' }),
-    ''
+    '<think>\nWe'
   );
 
   assert.equal(
     assemble({ v: ' need' }),
-    ''
+    ' need'
   );
 
   assert.equal(
     assemble({ p: 'response/content', v: 'OK' }),
-    'OK'
+    '\n</think>\nOK'
   );
 
   assert.equal(

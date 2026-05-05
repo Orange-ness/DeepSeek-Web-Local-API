@@ -13,7 +13,8 @@ import {
   parseChatCompletionRequest,
   parsePasswordLogin,
   resolveModel,
-  PUBLIC_MODELS
+  PUBLIC_MODELS,
+  REASONING_MODES
 } from './models.js';
 import {
   createChatCompletionChunk,
@@ -190,6 +191,10 @@ export class DeepSeekApiService {
     return this.client.traceStore.getLatest();
   }
 
+  async getAllUpstreamTraces() {
+    return this.client.traceStore.getAll();
+  }
+
   async getUpstreamTraceById(id) {
     return this.client.traceStore.getById(id);
   }
@@ -201,9 +206,60 @@ export class DeepSeekApiService {
     };
   }
 
+  getCapabilities() {
+    return {
+      object: 'deepseek_web_local_api.capabilities',
+      reasoning_modes: REASONING_MODES,
+      generation_parameters: {
+        temperature: { type: 'number', minimum: 0, maximum: 2 },
+        top_p: { type: 'number', minimum: 0, maximum: 1 },
+        max_tokens: { type: 'integer', minimum: 1 }
+      },
+      conversation_controls: {
+        context_size: {
+          type: 'integer',
+          minimum: 1,
+          description: 'Keeps the most recent non-system messages while preserving system instructions.'
+        },
+        system_prompt: {
+          type: 'string',
+          description: 'Prepends a system instruction without requiring clients to rewrite messages.'
+        }
+      },
+      compatibility: {
+        chat_completions: true,
+        streaming: true,
+        response_format_json_object: true,
+        tool_calling: 'emulated',
+        parallel_tool_calls: true,
+        attachments: {
+          image_url: true,
+          input_file: true
+        }
+      },
+      endpoints: [
+        'GET /health',
+        'GET /metrics',
+        'GET /auth/status',
+        'GET /auth/debug',
+        'POST /auth/login/browser',
+        'POST /auth/login/password',
+        'POST /auth/login/auto',
+        'POST /auth/logout',
+        'POST /debug/cleanup-sessions',
+        'GET /debug/upstream/latest',
+        'GET /debug/upstream/:id',
+        'GET /v1/models',
+        'GET /v1/capabilities',
+        'POST /v1/chat/completions'
+      ],
+      ide_clients: ['Continue', 'Cline', 'Zed']
+    };
+  }
+
   parseChatRequest(payload) {
     const request = parseChatCompletionRequest(payload);
-    const model = resolveModel(request.model);
+    const model = resolveModel(request.model, request.reasoning_mode);
 
     return {
       request,
@@ -269,8 +325,11 @@ export class DeepSeekApiService {
           const openResult = await this.client.openChatStream({
             session,
             prompt,
+            attachments: request.attachments,
             thinkingEnabled: model.thinkingEnabled,
+            reasoningMode: model.reasoningMode,
             temperature: request.temperature,
+            topP: request.top_p,
             maxTokens: request.max_tokens,
             metadata: request.metadata,
             responseFormat: request.response_format,
@@ -325,12 +384,17 @@ export class DeepSeekApiService {
       signal
     });
 
+    let finalContent = result.content || '';
+    if (finalContent.includes('<think>')) {
+      finalContent = finalContent.replace(/<think>[\s\S]*?<\/think>\s*/g, '').trim();
+    }
+
     return {
       ...result,
       response: createChatCompletionResponse({
         id,
         model: model.publicModel,
-        content: result.content
+        content: finalContent
       })
     };
   }
@@ -341,7 +405,7 @@ export class DeepSeekApiService {
     let refreshedSession = false;
     let traceId = null;
 
-    for (let structuredAttempt = 1; structuredAttempt <= 2; structuredAttempt += 1) {
+    for (let structuredAttempt = 1; structuredAttempt <= 3; structuredAttempt += 1) {
       const upstream = await this.executeUpstreamTextCompletion({
         request,
         model,
@@ -381,7 +445,7 @@ export class DeepSeekApiService {
           })
         };
       } catch (error) {
-        if (structuredAttempt === 2) {
+        if (structuredAttempt === 3) {
           throw createFunctionCallingParseError(error, upstream.content);
         }
 
@@ -417,8 +481,11 @@ export class DeepSeekApiService {
         this.client.completeChat({
           session,
           prompt: finalPrompt,
+          attachments: request.attachments,
           thinkingEnabled: model.thinkingEnabled,
+          reasoningMode: model.reasoningMode,
           temperature: request.temperature,
+          topP: request.top_p,
           maxTokens: request.max_tokens,
           metadata: request.metadata,
           responseFormat: responseFormat || request.response_format,

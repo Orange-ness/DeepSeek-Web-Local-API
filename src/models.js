@@ -6,13 +6,60 @@ export const PUBLIC_MODELS = [
     id: 'deepseek-web-chat',
     object: 'model',
     created: 0,
-    owned_by: 'deepseek-web'
+    owned_by: 'deepseek-web',
+    reasoning_mode: 'Instant'
   },
   {
     id: 'deepseek-web-think',
     object: 'model',
     created: 0,
-    owned_by: 'deepseek-web'
+    owned_by: 'deepseek-web',
+    reasoning_mode: 'Expert'
+  },
+  {
+    id: 'deepseek-web-instant',
+    object: 'model',
+    created: 0,
+    owned_by: 'deepseek-web',
+    reasoning_mode: 'Instant'
+  },
+  {
+    id: 'deepseek-web-expert',
+    object: 'model',
+    created: 0,
+    owned_by: 'deepseek-web',
+    reasoning_mode: 'Expert'
+  },
+  {
+    id: 'deepseek-web-vision',
+    object: 'model',
+    created: 0,
+    owned_by: 'deepseek-web',
+    reasoning_mode: 'Vision'
+  }
+];
+
+export const REASONING_MODES = [
+  {
+    id: 'Instant',
+    model: 'deepseek-web-instant',
+    description: 'Fast chat mode with DeepSeek thinking disabled.',
+    thinking_enabled: false,
+    vision_enabled: false
+  },
+  {
+    id: 'Expert',
+    model: 'deepseek-web-expert',
+    description: 'Reasoning mode with DeepSeek thinking enabled.',
+    thinking_enabled: true,
+    vision_enabled: false
+  },
+  {
+    id: 'Vision',
+    model: 'deepseek-web-vision',
+    description: 'Attachment-aware mode for image and file inputs.',
+    thinking_enabled: false,
+    vision_enabled: true
   }
 ];
 
@@ -20,6 +67,50 @@ const textPartSchema = z.object({
   type: z.literal('text'),
   text: z.string()
 }).passthrough();
+
+const imageUrlPartSchema = z.object({
+  type: z.literal('image_url'),
+  image_url: z.union([
+    z.string(),
+    z.object({
+      url: z.string(),
+      detail: z.string().optional(),
+      filename: z.string().optional(),
+      media_type: z.string().optional()
+    }).passthrough()
+  ])
+}).passthrough();
+
+const inputFilePartSchema = z.object({
+  type: z.literal('input_file'),
+  input_file: z.object({
+    path: z.string().optional(),
+    url: z.string().optional(),
+    data: z.string().optional(),
+    file_data: z.string().optional(),
+    filename: z.string().optional(),
+    media_type: z.string().optional()
+  }).passthrough()
+}).passthrough().superRefine((value, context) => {
+  const input = value.input_file || {};
+  const providedSources = [input.path, input.url, input.data, input.file_data].filter(Boolean);
+
+  if (providedSources.length === 0) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'input_file requires one of path, url, data, or file_data.'
+    });
+  }
+
+  if (providedSources.length > 1) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'input_file must provide exactly one source.'
+    });
+  }
+});
+
+const contentPartSchema = z.union([textPartSchema, imageUrlPartSchema, inputFilePartSchema]);
 
 const declaredFunctionSchema = z.object({
   name: z.string().min(1),
@@ -43,7 +134,7 @@ const assistantToolCallSchema = z.object({
 
 const chatMessageSchema = z.object({
   role: z.enum(['system', 'developer', 'user', 'assistant', 'tool']),
-  content: z.union([z.string(), z.null(), z.array(textPartSchema).min(1)]).optional().default(''),
+  content: z.union([z.string(), z.null(), z.array(contentPartSchema).min(1)]).optional().default(''),
   name: z.string().optional(),
   tool_call_id: z.string().optional(),
   tool_calls: z.array(assistantToolCallSchema).optional()
@@ -61,7 +152,11 @@ export const chatCompletionRequestSchema = z.object({
   temperature: z.number().min(0).max(2).optional(),
   max_tokens: z.number().int().positive().optional(),
   max_completion_tokens: z.number().int().positive().optional(),
-  top_p: z.number().optional(),
+  top_p: z.number().min(0).max(1).optional(),
+  context_size: z.number().int().positive().optional(),
+  system_prompt: z.string().optional(),
+  reasoning_mode: z.string().optional(),
+  mode: z.string().optional(),
   presence_penalty: z.number().optional(),
   frequency_penalty: z.number().optional(),
   stop: z.union([z.string(), z.array(z.string()).min(1)]).optional(),
@@ -134,11 +229,36 @@ export const cleanupSessionsSchema = z.object({
   max_delete: z.number().int().positive().optional().default(200)
 }).strict();
 
+const REASONING_MODE_BY_ID = new Map(REASONING_MODES.map((mode) => [mode.id, mode]));
+const REASONING_MODE_ALIASES = new Map([
+  ['instant', 'Instant'],
+  ['fast', 'Instant'],
+  ['chat', 'Instant'],
+  ['default', 'Instant'],
+  ['minimal', 'Instant'],
+  ['low', 'Instant'],
+  ['expert', 'Expert'],
+  ['think', 'Expert'],
+  ['thinking', 'Expert'],
+  ['reason', 'Expert'],
+  ['reasoning', 'Expert'],
+  ['high', 'Expert'],
+  ['xhigh', 'Expert'],
+  ['medium', 'Expert'],
+  ['vision', 'Vision'],
+  ['visual', 'Vision'],
+  ['image', 'Vision'],
+  ['multimodal', 'Vision']
+]);
+
 const MODEL_ALIASES = new Map([
-  ['deepseek-web-chat', { publicModel: 'deepseek-web-chat', thinkingEnabled: false }],
-  ['deepseek-chat', { publicModel: 'deepseek-web-chat', thinkingEnabled: false }],
-  ['deepseek-web-think', { publicModel: 'deepseek-web-think', thinkingEnabled: true }],
-  ['deepseek-reasoner', { publicModel: 'deepseek-web-think', thinkingEnabled: true }]
+  ['deepseek-web-chat', { publicModel: 'deepseek-web-chat', reasoningMode: 'Instant' }],
+  ['deepseek-chat', { publicModel: 'deepseek-web-chat', reasoningMode: 'Instant' }],
+  ['deepseek-web-instant', { publicModel: 'deepseek-web-instant', reasoningMode: 'Instant' }],
+  ['deepseek-web-think', { publicModel: 'deepseek-web-think', reasoningMode: 'Expert' }],
+  ['deepseek-reasoner', { publicModel: 'deepseek-web-think', reasoningMode: 'Expert' }],
+  ['deepseek-web-expert', { publicModel: 'deepseek-web-expert', reasoningMode: 'Expert' }],
+  ['deepseek-web-vision', { publicModel: 'deepseek-web-vision', reasoningMode: 'Vision' }]
 ]);
 
 export function parseChatCompletionRequest(payload) {
@@ -147,14 +267,16 @@ export function parseChatCompletionRequest(payload) {
     const normalizedTools = normalizeDeclaredTools(parsed);
     const normalizedToolChoice = normalizeToolChoice(parsed, normalizedTools);
     validateIgnoredChatFields(parsed, normalizedTools, normalizedToolChoice);
-    return {
-      ...parsed,
-      max_tokens: parsed.max_tokens ?? parsed.max_completion_tokens,
-      tools: normalizedTools,
-      tool_choice: normalizedToolChoice,
-      messages: parsed.messages.map((message) => ({
+    const reasoningMode = normalizeReasoningMode(
+      parsed.reasoning_mode || parsed.mode || reasoningEffortToReasoningMode(parsed.reasoning_effort)
+    );
+    const normalizedMessages = parsed.messages.map((message) => {
+      const contentParts = normalizeMessageContentParts(message.content);
+
+      return {
         role: normalizeMessageRole(message.role),
         content: normalizeMessageContent(message.content),
+        content_parts: contentParts,
         ...(message.name ? { name: message.name } : {}),
         ...(message.tool_call_id ? { tool_call_id: message.tool_call_id } : {}),
         ...(message.tool_calls
@@ -168,8 +290,22 @@ export function parseChatCompletionRequest(payload) {
                 }
               }))
             }
-          : {})
-      }))
+        : {})
+      };
+    });
+    const controlledMessages = applyConversationControls(normalizedMessages, {
+      contextSize: parsed.context_size,
+      systemPrompt: parsed.system_prompt
+    });
+
+    return {
+      ...parsed,
+      max_tokens: parsed.max_tokens ?? parsed.max_completion_tokens,
+      reasoning_mode: reasoningMode,
+      tools: normalizedTools,
+      tool_choice: normalizedToolChoice,
+      messages: controlledMessages,
+      attachments: collectMessageAttachments(controlledMessages)
     };
   } catch (error) {
     throw new BadRequestError('Invalid chat completion payload.', error.issues ?? error.message);
@@ -192,13 +328,40 @@ export function parseAutoLogin(payload) {
   }
 }
 
-export function resolveModel(model) {
+export function resolveModel(model, requestedReasoningMode) {
   const resolved = MODEL_ALIASES.get(model);
   if (!resolved) {
     throw new BadRequestError(`Unsupported model "${model}".`);
   }
 
-  return resolved;
+  const reasoningMode = requestedReasoningMode || resolved.reasoningMode;
+  const mode = REASONING_MODE_BY_ID.get(reasoningMode);
+  if (!mode) {
+    throw new BadRequestError(`Unsupported reasoning_mode "${reasoningMode}".`);
+  }
+
+  return {
+    publicModel: requestedReasoningMode ? mode.model : resolved.publicModel,
+    thinkingEnabled: mode.thinking_enabled,
+    reasoningMode: mode.id,
+    visionEnabled: mode.vision_enabled
+  };
+}
+
+export function normalizeReasoningMode(value) {
+  if (!value) {
+    return null;
+  }
+
+  const normalized = String(value).trim().toLowerCase();
+  const mode = REASONING_MODE_ALIASES.get(normalized);
+  if (!mode) {
+    throw new BadRequestError(
+      `Unsupported reasoning_mode "${value}". Supported modes are Instant, Expert, and Vision.`
+    );
+  }
+
+  return mode;
 }
 
 export function parseCleanupSessions(payload) {
@@ -218,7 +381,95 @@ export function normalizeMessageContent(content) {
     return content;
   }
 
-  return content.map((part) => part.text).join('');
+  return normalizeMessageContentParts(content)
+    .filter((part) => part.type === 'text')
+    .map((part) => part.text)
+    .join('');
+}
+
+export function normalizeMessageContentParts(content) {
+  if (content == null) {
+    return [];
+  }
+
+  if (typeof content === 'string') {
+    return content ? [{ type: 'text', text: content }] : [];
+  }
+
+  return content.map((part) => {
+    if (part.type === 'text') {
+      return {
+        type: 'text',
+        text: part.text
+      };
+    }
+
+    if (part.type === 'image_url') {
+      const image = normalizeImagePart(part.image_url);
+      return {
+        type: 'image_url',
+        image_url: image
+      };
+    }
+
+    const input = part.input_file;
+    return {
+      type: 'input_file',
+      input_file: {
+        ...(input.path ? { path: input.path } : {}),
+        ...(input.url ? { url: input.url } : {}),
+        ...(input.data ? { data: input.data } : {}),
+        ...(input.file_data ? { file_data: input.file_data } : {}),
+        ...(input.filename ? { filename: input.filename } : {}),
+        ...(input.media_type ? { media_type: input.media_type } : {})
+      }
+    };
+  });
+}
+
+function applyConversationControls(messages, { contextSize, systemPrompt } = {}) {
+  const instructions = [];
+  if (systemPrompt && systemPrompt.trim()) {
+    instructions.push({
+      role: 'system',
+      content: systemPrompt,
+      content_parts: normalizeMessageContentParts(systemPrompt)
+    });
+  }
+
+  const systemMessages = [];
+  const conversationMessages = [];
+  for (const message of messages) {
+    if (message.role === 'system') {
+      systemMessages.push(message);
+      continue;
+    }
+
+    conversationMessages.push(message);
+  }
+
+  const trimmedConversation =
+    contextSize === undefined
+      ? conversationMessages
+      : trimConversationWindow(conversationMessages, contextSize);
+
+  return [...instructions, ...systemMessages, ...trimmedConversation];
+}
+
+function trimConversationWindow(messages, contextSize) {
+  if (!Number.isInteger(contextSize) || contextSize <= 0 || messages.length <= contextSize) {
+    return messages;
+  }
+
+  return messages.slice(-contextSize);
+}
+
+function reasoningEffortToReasoningMode(value) {
+  if (!value) {
+    return null;
+  }
+
+  return REASONING_MODE_ALIASES.get(String(value).trim().toLowerCase()) || null;
 }
 
 function normalizeMessageRole(role) {
@@ -320,6 +571,13 @@ export function flattenMessagesToPrompt(messages, { responseFormat } = {}) {
     const message = messages[index];
     if (message.role === current.role) {
       current.content += `\n\n${message.content}`;
+      if (Array.isArray(current.content_parts)) {
+        current.content_parts = [
+          ...current.content_parts,
+          { type: 'text', text: '\n\n' },
+          ...(Array.isArray(message.content_parts) ? message.content_parts : [])
+        ];
+      }
       continue;
     }
 
@@ -331,15 +589,17 @@ export function flattenMessagesToPrompt(messages, { responseFormat } = {}) {
 
   let prompt = mergedBlocks
     .map((block, index) => {
+      const renderedContent = renderPromptContent(block);
+
       if (block.role === 'assistant') {
-        return `<｜Assistant｜>${block.content}<｜end▁of▁sentence｜>`;
+        return `<｜Assistant｜>${renderedContent}<｜end▁of▁sentence｜>`;
       }
 
       if (block.role === 'user' || block.role === 'system') {
-        return index > 0 ? `<｜User｜>${block.content}` : block.content;
+        return index > 0 ? `<｜User｜>${renderedContent}` : renderedContent;
       }
 
-      return block.content;
+      return renderedContent;
     })
     .join('')
     .replace(/\!\[.+\]\(.+\)/g, '');
@@ -349,4 +609,186 @@ export function flattenMessagesToPrompt(messages, { responseFormat } = {}) {
   }
 
   return prompt;
+}
+
+export function collectMessageAttachments(messages) {
+  const attachments = [];
+
+  messages.forEach((message, messageIndex) => {
+    const contentParts = Array.isArray(message.content_parts) ? message.content_parts : [];
+
+    contentParts.forEach((part, partIndex) => {
+      if (part.type === 'image_url') {
+        attachments.push({
+          kind: 'image',
+          source_type: detectAttachmentSourceType(part.image_url.url),
+          source: part.image_url.url,
+          file_name: part.image_url.filename || deriveAttachmentName(part.image_url.url, 'image'),
+          media_type: part.image_url.media_type || null,
+          message_index: messageIndex,
+          part_index: partIndex
+        });
+        return;
+      }
+
+      if (part.type === 'input_file') {
+        const input = part.input_file;
+        const source = input.path ?? input.url ?? input.data ?? input.file_data;
+        const sourceType =
+          input.path
+            ? 'path'
+            : input.url
+              ? detectAttachmentSourceType(input.url)
+              : isDataUrl(input.data ?? input.file_data)
+                ? 'data_url'
+                : 'base64';
+
+        attachments.push({
+          kind: 'file',
+          source_type: sourceType,
+          source,
+          file_name:
+            input.filename ||
+            deriveAttachmentName(input.path || input.url || null, 'attachment'),
+          media_type: input.media_type || null,
+          message_index: messageIndex,
+          part_index: partIndex
+        });
+      }
+    });
+  });
+
+  return attachments;
+}
+
+function renderPromptContent(message) {
+  let baseContent = message.content || '';
+
+  if (Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
+    const toolsStr = JSON.stringify(
+      message.tool_calls.map((tc) => {
+        let args = tc.function?.arguments || tc.arguments;
+        if (typeof args === 'string') {
+          try {
+            args = JSON.parse(args);
+          } catch {}
+        }
+        return {
+          name: tc.function?.name || tc.name,
+          arguments: args
+        };
+      }),
+      null,
+      2
+    );
+    baseContent = (baseContent ? baseContent + '\n\n' : '') + '[Tool Calls]\n' + toolsStr;
+  } else if (message.role === 'tool') {
+    baseContent = `[Tool Result: ${message.name || 'unknown'}]\n${baseContent}`;
+  }
+
+  const contentParts = Array.isArray(message.content_parts) ? message.content_parts : null;
+  if (!contentParts || contentParts.length === 0) {
+    return baseContent;
+  }
+
+  const rendered = contentParts
+    .map((part) => {
+      if (part.type === 'text') {
+        return part.text;
+      }
+
+      if (part.type === 'image_url') {
+        return `\n[Attached image: ${part.image_url.filename || deriveAttachmentName(part.image_url.url, 'image')}]\n`;
+      }
+
+      return `\n[Attached file: ${part.input_file.filename || deriveAttachmentName(part.input_file.path || part.input_file.url || null, 'attachment')}]\n`;
+    })
+    .join('');
+
+  return rendered || message.content || '';
+}
+
+function normalizeImagePart(value) {
+  if (typeof value === 'string') {
+    return {
+      url: value
+    };
+  }
+
+  return {
+    url: value.url,
+    ...(value.detail ? { detail: value.detail } : {}),
+    ...(value.filename ? { filename: value.filename } : {}),
+    ...(value.media_type ? { media_type: value.media_type } : {})
+  };
+}
+
+function detectAttachmentSourceType(value) {
+  if (isDataUrl(value)) {
+    return 'data_url';
+  }
+
+  if (/^https?:\/\//iu.test(value) || /^file:\/\//iu.test(value)) {
+    return 'url';
+  }
+
+  if (looksLikePath(value)) {
+    return 'path';
+  }
+
+  return 'url';
+}
+
+function deriveAttachmentName(value, fallbackBaseName) {
+  if (!value) {
+    return fallbackBaseName;
+  }
+
+  if (isDataUrl(value)) {
+    const mediaType = value.slice(5, value.indexOf(';'));
+    const extension = extensionFromMediaType(mediaType);
+    return extension ? `${fallbackBaseName}.${extension}` : fallbackBaseName;
+  }
+
+  try {
+    const url = new URL(value);
+    const pathname = url.pathname || '';
+    const fromUrl = pathname.split('/').filter(Boolean).pop();
+    if (fromUrl) {
+      return fromUrl;
+    }
+  } catch {}
+
+  const normalized = String(value).replace(/\\/gu, '/');
+  const fromPath = normalized.split('/').filter(Boolean).pop();
+  return fromPath || fallbackBaseName;
+}
+
+function looksLikePath(value) {
+  return (
+    value.startsWith('/') ||
+    value.startsWith('./') ||
+    value.startsWith('../') ||
+    /^[A-Za-z]:[\\/]/u.test(value)
+  );
+}
+
+function isDataUrl(value) {
+  return typeof value === 'string' && value.startsWith('data:');
+}
+
+function extensionFromMediaType(mediaType) {
+  const mapping = new Map([
+    ['image/png', 'png'],
+    ['image/jpeg', 'jpg'],
+    ['image/jpg', 'jpg'],
+    ['image/webp', 'webp'],
+    ['image/gif', 'gif'],
+    ['image/svg+xml', 'svg'],
+    ['text/plain', 'txt'],
+    ['application/pdf', 'pdf'],
+    ['application/json', 'json']
+  ]);
+
+  return mapping.get(String(mediaType || '').toLowerCase()) || '';
 }

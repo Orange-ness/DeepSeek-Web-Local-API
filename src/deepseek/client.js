@@ -1,14 +1,24 @@
+import crypto from 'node:crypto';
+import fs from 'node:fs/promises';
+import path from 'node:path';
 import { fetch } from 'undici';
 import { createDeepSeekDeltaAssembler, iterateSseEvents } from '../sse.js';
-import { UpstreamError } from '../errors.js';
+import { BadRequestError, UpstreamError } from '../errors.js';
 import { PendingChatSessionStore } from '../storage.js';
 import { buildPowResponse } from './challenge.js';
 import { stripTrailingSlash } from './defaults.js';
 import { UpstreamTraceStore } from './trace-store.js';
 
 const CHAT_COMPLETION_TARGET_PATH = '/api/v0/chat/completion';
+const FILE_UPLOAD_TARGET_PATH = '/api/v0/file/upload_file';
+const FILE_UPLOAD_PATH = '/file/upload_file';
 const CREATE_POW_CHALLENGE_URL = 'https://chat.deepseek.com/api/v0/chat/create_pow_challenge';
 const FETCH_CHAT_SESSIONS_PATH = '/chat_session/fetch_page?lte_cursor.pinned=false';
+const FETCH_FILES_PATH = '/file/fetch_files';
+const FILE_READY_POLL_INTERVAL_MS = 1500;
+const FILE_READY_MAX_ATTEMPTS = 15;
+const PENDING_FILE_STATUSES = new Set(['PENDING', 'PARSING']);
+const SUCCESS_FILE_STATUS = 'SUCCESS';
 
 export class DeepSeekWebClient {
   constructor(
@@ -65,8 +75,11 @@ export class DeepSeekWebClient {
   async openChatStream({
     session,
     prompt,
+    attachments = [],
     thinkingEnabled,
+    reasoningMode,
     temperature,
+    topP,
     maxTokens,
     metadata,
     responseFormat,
@@ -75,7 +88,13 @@ export class DeepSeekWebClient {
     const trace = this.traceStore.start({
       endpoint: 'chat_completion',
       prompt_preview: prompt.slice(0, 500),
+      reasoning_mode: reasoningMode || (thinkingEnabled ? 'Expert' : 'Instant'),
       thinking_enabled: Boolean(thinkingEnabled),
+      generation: {
+        ...(temperature !== undefined ? { temperature } : {}),
+        ...(topP !== undefined ? { top_p: topP } : {}),
+        ...(maxTokens !== undefined ? { max_tokens: maxTokens } : {})
+      },
       metadata_keys: Object.keys(metadata || {}),
       response_format: responseFormat?.type || 'text'
     });
@@ -87,6 +106,11 @@ export class DeepSeekWebClient {
       cleanup = createCleanupTask(() =>
         this.deleteChatSession(session, chatSessionId, { trace })
       );
+      const refFileIds = await this.prepareRefFileIds(session, attachments, {
+        trace,
+        signal,
+        thinkingEnabled
+      });
       const powResponse = await this.createPowResponse(session, { trace, signal });
       const headers = buildHeaders(session, {
         'x-ds-pow-response': powResponse
@@ -95,10 +119,11 @@ export class DeepSeekWebClient {
         chat_session_id: chatSessionId,
         parent_message_id: null,
         prompt,
-        ref_file_ids: [],
+        ref_file_ids: refFileIds,
         thinking_enabled: thinkingEnabled,
         search_enabled: false,
         ...(temperature !== undefined ? { temperature } : {}),
+        ...(topP !== undefined ? { top_p: topP } : {}),
         ...(maxTokens !== undefined ? { max_tokens: maxTokens } : {})
       };
 
@@ -226,11 +251,18 @@ export class DeepSeekWebClient {
     return chatSessionId;
   }
 
-  async createPowResponse(session, { trace, signal }) {
+  async createPowResponse(
+    session,
+    {
+      trace,
+      signal,
+      targetPath = CHAT_COMPLETION_TARGET_PATH
+    }
+  ) {
     const response = await this.fetch(CREATE_POW_CHALLENGE_URL, {
       method: 'POST',
       headers: buildHeaders(session),
-      body: JSON.stringify({ target_path: CHAT_COMPLETION_TARGET_PATH }),
+      body: JSON.stringify({ target_path: targetPath }),
       signal: createRequestSignal({
         signal,
         timeoutMs: this.config.upstreamTimeoutMs
@@ -250,15 +282,171 @@ export class DeepSeekWebClient {
       });
     }
 
-    const powResponse = await this.powResponseBuilder(challenge, CHAT_COMPLETION_TARGET_PATH);
+    const powResponse = await this.powResponseBuilder(challenge, targetPath);
     this.traceStore.recordStep(trace, {
       type: 'pow_challenge',
       status: response.status,
+      target_path: targetPath,
       difficulty: challenge.difficulty,
       expire_at: challenge.expire_at
     });
 
     return powResponse;
+  }
+
+  async prepareRefFileIds(session, attachments, { trace, signal, thinkingEnabled }) {
+    if (!Array.isArray(attachments) || attachments.length === 0) {
+      return [];
+    }
+
+    const refFileIds = [];
+
+    for (const attachment of attachments) {
+      const resolved = await resolveAttachmentInput(attachment, {
+        fetchImpl: this.fetch
+      });
+      const upload = await this.uploadFile(session, resolved, {
+        trace,
+        signal,
+        thinkingEnabled
+      });
+      const readyFile = await this.waitForFileReady(session, upload.id, {
+        trace,
+        signal,
+        attachment: resolved
+      });
+
+      if (readyFile.status !== SUCCESS_FILE_STATUS) {
+        throw new BadRequestError(
+          `DeepSeek could not use attachment "${resolved.fileName}" (status: ${readyFile.status}). Images currently rely on DeepSeek Web file extraction, so non-text images may fail unless readable text can be extracted.`,
+          {
+            file_id: readyFile.id,
+            file_name: readyFile.file_name,
+            status: readyFile.status,
+            error_code: readyFile.error_code || null
+          }
+        );
+      }
+
+      refFileIds.push(upload.id);
+    }
+
+    return refFileIds;
+  }
+
+  async uploadFile(session, file, { trace, signal, thinkingEnabled }) {
+    const powResponse = await this.createPowResponse(session, {
+      trace,
+      signal,
+      targetPath: FILE_UPLOAD_TARGET_PATH
+    });
+    const { boundary, body } = buildMultipartBody(file);
+    const headers = buildHeaders(
+      session,
+      {
+        'x-ds-pow-response': powResponse,
+        'x-file-size': String(file.buffer.length),
+        'x-thinking-enabled': thinkingEnabled ? '1' : '0',
+        'content-type': `multipart/form-data; boundary=${boundary}`,
+        'content-length': String(body.length)
+      },
+      {
+        omitContentType: true
+      }
+    );
+    const uploadUrl = `${stripTrailingSlash(session?.transport?.baseUrl || this.config.deepSeekBaseUrl)}${FILE_UPLOAD_PATH}`;
+
+    this.traceStore.recordStep(trace, {
+      type: 'upload_file_request',
+      url: uploadUrl,
+      file_name: file.fileName,
+      media_type: file.contentType,
+      file_size: file.buffer.length
+    });
+
+    const response = await this.fetch(uploadUrl, {
+      method: 'POST',
+      headers,
+      body,
+      signal: createRequestSignal({
+        signal,
+        timeoutMs: this.config.upstreamTimeoutMs
+      })
+    });
+    const payload = await parseDeepSeekJsonResponse(response, 'DeepSeek file upload failed.');
+    const uploadedFile = payload?.data?.biz_data || null;
+
+    if (!uploadedFile?.id) {
+      throw new UpstreamError('DeepSeek file upload response did not include a file id.', {
+        statusCode: 502,
+        code: 'upstream_file_upload_invalid'
+      });
+    }
+
+    this.traceStore.recordStep(trace, {
+      type: 'upload_file_response',
+      status: response.status,
+      file_id: uploadedFile.id,
+      file_name: uploadedFile.file_name,
+      file_status: uploadedFile.status
+    });
+
+    return uploadedFile;
+  }
+
+  async waitForFileReady(session, fileId, { trace, signal, attachment }) {
+    for (let attempt = 1; attempt <= FILE_READY_MAX_ATTEMPTS; attempt += 1) {
+      const file = await this.fetchFileInfo(session, fileId, { signal });
+      this.traceStore.recordStep(trace, {
+        type: 'file_status',
+        attempt,
+        file_id: file.id,
+        file_name: file.file_name,
+        file_status: file.status,
+        token_usage: file.token_usage ?? null
+      });
+
+      if (!PENDING_FILE_STATUSES.has(file.status)) {
+        return file;
+      }
+
+      await sleep(FILE_READY_POLL_INTERVAL_MS);
+    }
+
+    throw new UpstreamError(`DeepSeek did not finish parsing attachment "${attachment.fileName}" in time.`, {
+      statusCode: 504,
+      code: 'upstream_file_parse_timeout',
+      details: {
+        file_name: attachment.fileName,
+        file_id: fileId
+      }
+    });
+  }
+
+  async fetchFileInfo(session, fileId, { signal } = {}) {
+    const baseUrl = stripTrailingSlash(session?.transport?.baseUrl || this.config.deepSeekBaseUrl);
+    const response = await this.fetch(`${baseUrl}${FETCH_FILES_PATH}?file_ids=${encodeURIComponent(fileId)}`, {
+      method: 'GET',
+      headers: buildHeaders(session, {}, { omitContentType: true }),
+      signal: createRequestSignal({
+        signal,
+        timeoutMs: this.config.upstreamTimeoutMs
+      })
+    });
+    const payload = await parseDeepSeekJsonResponse(
+      response,
+      'DeepSeek file status fetch failed.'
+    );
+    const file = payload?.data?.biz_data?.files?.[0];
+
+    if (!file) {
+      throw new UpstreamError('DeepSeek file status response did not include the requested file.', {
+        statusCode: 502,
+        code: 'upstream_file_status_invalid'
+      });
+    }
+
+    return file;
   }
 
   async deleteChatSession(session, chatSessionId, { trace } = {}) {
@@ -552,13 +740,22 @@ async function* createManagedTextStream(stream, { onClose } = {}) {
   }
 }
 
-function buildHeaders(session, extraHeaders = {}) {
-  return {
+function buildHeaders(session, extraHeaders = {}, { omitContentType = false } = {}) {
+  const headers = {
     ...session.transport.headers,
     authorization: session.authToken.startsWith('Bearer ')
       ? session.authToken
       : `Bearer ${session.authToken}`,
-    cookie: session.cookieHeader,
+    cookie: session.cookieHeader
+  };
+
+  if (omitContentType) {
+    delete headers['content-type'];
+    delete headers['Content-Type'];
+  }
+
+  return {
+    ...headers,
     ...extraHeaders
   };
 }
@@ -759,4 +956,189 @@ function isDeepSeekSuccessPayload(payload) {
   }
 
   return (payload.code ?? 0) === 0 && (payload.data?.biz_code ?? 0) === 0;
+}
+
+function buildMultipartBody(file) {
+  const boundary = `----NodeFormBoundary${crypto.randomBytes(12).toString('hex')}`;
+  const head = Buffer.from(
+    `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${escapeMultipartValue(file.fileName)}"\r\nContent-Type: ${file.contentType}\r\n\r\n`,
+    'utf8'
+  );
+  const tail = Buffer.from(`\r\n--${boundary}--\r\n`, 'utf8');
+
+  return {
+    boundary,
+    body: Buffer.concat([head, file.buffer, tail])
+  };
+}
+
+async function resolveAttachmentInput(attachment, { fetchImpl }) {
+  if (attachment.source_type === 'data_url') {
+    return resolveDataUrlAttachment(attachment);
+  }
+
+  if (attachment.source_type === 'base64') {
+    return resolveBase64Attachment(attachment);
+  }
+
+  if (attachment.source_type === 'path') {
+    return resolvePathAttachment(attachment);
+  }
+
+  return resolveRemoteAttachment(attachment, { fetchImpl });
+}
+
+function resolveDataUrlAttachment(attachment) {
+  const match = String(attachment.source || '').match(/^data:([^;,]+)?(?:;charset=[^;,]+)?;base64,(.+)$/isu);
+  if (!match) {
+    throw new BadRequestError(`Attachment "${attachment.file_name || 'attachment'}" is not a valid data URL.`);
+  }
+
+  const mediaType = attachment.media_type || match[1] || inferContentType(attachment.file_name, attachment.kind);
+  return {
+    fileName: attachment.file_name || defaultFileName(attachment.kind, mediaType),
+    contentType: mediaType,
+    buffer: Buffer.from(match[2], 'base64')
+  };
+}
+
+function resolveBase64Attachment(attachment) {
+  const mediaType = attachment.media_type || inferContentType(attachment.file_name, attachment.kind);
+  return {
+    fileName: attachment.file_name || defaultFileName(attachment.kind, mediaType),
+    contentType: mediaType,
+    buffer: Buffer.from(String(attachment.source || ''), 'base64')
+  };
+}
+
+async function resolvePathAttachment(attachment) {
+  const rawPath = attachment.source_type === 'path' ? attachment.source : attachment.file_name;
+  const localPath =
+    rawPath instanceof URL
+      ? rawPath
+      : String(rawPath).startsWith('file://')
+        ? new URL(rawPath)
+        : rawPath;
+  const buffer = await fs.readFile(localPath);
+  const fileName =
+    attachment.file_name ||
+    path.basename(typeof localPath === 'string' ? localPath : localPath.pathname) ||
+    defaultFileName(attachment.kind, attachment.media_type);
+
+  return {
+    fileName,
+    contentType: attachment.media_type || inferContentType(fileName, attachment.kind),
+    buffer
+  };
+}
+
+async function resolveRemoteAttachment(attachment, { fetchImpl }) {
+  if (/^file:\/\//iu.test(String(attachment.source || ''))) {
+    return resolvePathAttachment({
+      ...attachment,
+      source_type: 'path',
+      source: new URL(attachment.source)
+    });
+  }
+
+  const response = await fetchImpl(attachment.source, {
+    method: 'GET',
+    signal: createRequestSignal({
+      signal: null,
+      timeoutMs: 20_000
+    })
+  });
+
+  if (!response.ok) {
+    throw new BadRequestError(
+      `Failed to fetch attachment "${attachment.file_name || attachment.source}" (${response.status} ${response.statusText}).`
+    );
+  }
+
+  const arrayBuffer = await response.arrayBuffer();
+  const contentType =
+    attachment.media_type ||
+    normalizeContentTypeHeader(response.headers.get('content-type')) ||
+    inferContentType(attachment.file_name, attachment.kind);
+
+  return {
+    fileName: attachment.file_name || deriveFileNameFromUrl(attachment.source, attachment.kind),
+    contentType,
+    buffer: Buffer.from(arrayBuffer)
+  };
+}
+
+function inferContentType(fileName, kind) {
+  const normalized = String(fileName || '').toLowerCase();
+  const mapping = [
+    ['.png', 'image/png'],
+    ['.jpg', 'image/jpeg'],
+    ['.jpeg', 'image/jpeg'],
+    ['.webp', 'image/webp'],
+    ['.gif', 'image/gif'],
+    ['.svg', 'image/svg+xml'],
+    ['.pdf', 'application/pdf'],
+    ['.json', 'application/json'],
+    ['.md', 'text/markdown'],
+    ['.csv', 'text/csv'],
+    ['.txt', 'text/plain']
+  ];
+
+  for (const [extension, contentType] of mapping) {
+    if (normalized.endsWith(extension)) {
+      return contentType;
+    }
+  }
+
+  return kind === 'image' ? 'image/png' : 'application/octet-stream';
+}
+
+function normalizeContentTypeHeader(value) {
+  return String(value || '')
+    .split(';')[0]
+    .trim()
+    .toLowerCase();
+}
+
+function deriveFileNameFromUrl(value, kind) {
+  try {
+    const url = new URL(value);
+    const fromPath = url.pathname.split('/').filter(Boolean).pop();
+    if (fromPath) {
+      return fromPath;
+    }
+  } catch {}
+
+  return defaultFileName(kind);
+}
+
+function defaultFileName(kind, mediaType = '') {
+  const extension = extensionFromContentType(mediaType);
+  const base = kind === 'image' ? 'image' : 'attachment';
+  return extension ? `${base}.${extension}` : base;
+}
+
+function extensionFromContentType(mediaType) {
+  const mapping = new Map([
+    ['image/png', 'png'],
+    ['image/jpeg', 'jpg'],
+    ['image/webp', 'webp'],
+    ['image/gif', 'gif'],
+    ['image/svg+xml', 'svg'],
+    ['application/pdf', 'pdf'],
+    ['application/json', 'json'],
+    ['text/plain', 'txt'],
+    ['text/markdown', 'md'],
+    ['text/csv', 'csv']
+  ]);
+
+  return mapping.get(String(mediaType || '').toLowerCase()) || '';
+}
+
+function escapeMultipartValue(value) {
+  return String(value || 'file').replace(/"/gu, '%22');
+}
+
+function sleep(durationMs) {
+  return new Promise((resolve) => setTimeout(resolve, durationMs));
 }

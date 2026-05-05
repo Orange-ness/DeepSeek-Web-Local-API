@@ -32,6 +32,7 @@ export async function* iterateSseEvents(stream) {
 export function createDeepSeekDeltaAssembler() {
   let assembled = '';
   let currentPatchPath = null;
+  let wasThinking = false;
 
   return (payload) => {
     const nextPatchPath = payload?.p || payload?.data?.p || null;
@@ -44,14 +45,31 @@ export function createDeepSeekDeltaAssembler() {
       return '';
     }
 
+    let rawDelta = '';
     if (next.startsWith(assembled)) {
-      const delta = next.slice(assembled.length);
+      rawDelta = next.slice(assembled.length);
       assembled = next;
-      return delta;
+    } else {
+      rawDelta = next;
+      assembled += next;
     }
 
-    assembled += next;
-    return next;
+    if (!rawDelta) {
+      return '';
+    }
+
+    const isThinking = isThinkingPath(currentPatchPath);
+    let formattedDelta = rawDelta;
+
+    if (isThinking && !wasThinking) {
+      formattedDelta = '<think>\n' + rawDelta;
+      wasThinking = true;
+    } else if (!isThinking && wasThinking) {
+      formattedDelta = '\n</think>\n' + rawDelta;
+      wasThinking = false;
+    }
+
+    return formattedDelta;
   };
 }
 
@@ -89,23 +107,41 @@ export function extractDeepSeekText(payload, currentPatchPath = null) {
   return '';
 }
 
+function isThinkingPath(patchPath) {
+  if (!patchPath) return false;
+  const path = String(patchPath);
+  return (
+    path.startsWith('response/thinking') ||
+    path.startsWith('response/search') ||
+    path.startsWith('thinking') ||
+    path.startsWith('search')
+  );
+}
+
+function isTextPatchPath(patchPath) {
+  if (!patchPath) return true;
+  const path = String(patchPath);
+  return (
+    path.startsWith('response/thinking') ||
+    path.startsWith('response/search') ||
+    path.startsWith('thinking') ||
+    path.startsWith('search') ||
+    path.startsWith('response/content') ||
+    path.startsWith('response/fragments') ||
+    path.startsWith('content') ||
+    path.startsWith('fragments')
+  );
+}
+
 function extractPatchDelta(payload, currentPatchPath) {
   if (typeof payload?.v === 'string') {
-    if (
-      !currentPatchPath ||
-      String(currentPatchPath).startsWith('response/content') ||
-      String(currentPatchPath).startsWith('response/fragments')
-    ) {
+    if (isTextPatchPath(currentPatchPath)) {
       return payload.v;
     }
   }
 
   if (typeof payload?.data?.v === 'string') {
-    if (
-      !currentPatchPath ||
-      String(currentPatchPath).startsWith('response/content') ||
-      String(currentPatchPath).startsWith('response/fragments')
-    ) {
+    if (isTextPatchPath(currentPatchPath)) {
       return payload.data.v;
     }
   }
