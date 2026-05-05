@@ -290,10 +290,6 @@ Capability discovery:
 curl http://127.0.0.1:8787/v1/capabilities
 ```
 
-Admin dashboard:
-
-Open `http://127.0.0.1:8787/admin` while the server is running. If `LOCAL_API_KEY` is set, enter it in the dashboard header; the page itself is public on the local bind address, but API data endpoints still require the bearer token.
-
 ### Continue
 
 Official docs: <https://docs.continue.dev/customize/model-providers/top-level/openai>
