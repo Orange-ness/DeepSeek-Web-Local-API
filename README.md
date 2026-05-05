@@ -38,6 +38,10 @@ npm start
 
 The server listens on `127.0.0.1:8787` by default.
 
+### Admin dashboard:
+
+Open `http://127.0.0.1:8787/admin` while the server is running. If `LOCAL_API_KEY` is set, enter it in the dashboard header; the page itself is public on the local bind address, but API data endpoints still require the bearer token.
+
 ## Authentication
 
 Visible browser bootstrap:
@@ -346,7 +350,7 @@ Official docs: <https://zed.dev/docs/ai/llm-providers>
 
 You can configure the local DeepSeek proxy directly through the Zed user interface:
 
-1. Click on the three dots menu in the Assistant panel and go to **Settings**.
+1. Click on the three dots menu in the Assistant panel and go to the Settings. (Or press Ctrl+Alt+C to open Settings.)
 2. Under the **LLM Providers** category, click **Add provider** and select **OpenAI**.
 3. Fill in the following configuration:
    - **Provider name**: `DeepSeek Local` (or any name you prefer)
